@@ -145,6 +145,69 @@ func TestControllerCropCapturedImageShiftsAnnotations(t *testing.T) {
 	}
 }
 
+func TestControllerUndoRedoAnnotationAndCrop(t *testing.T) {
+	controller := NewController(&fakeCapturer{
+		displays: []image.Rectangle{image.Rect(0, 0, 200, 120)},
+		img:      image.NewRGBA(image.Rect(0, 0, 200, 120)),
+	})
+	if err := controller.BeginCapture(); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.CommitImageSelection(image.Rect(20, 10, 140, 90)); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.AddAnnotation(editor.ToolRectangle, nil, editor.NewRect(editor.Point{X: 30, Y: 20}, editor.Point{X: 80, Y: 60})); err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.Editor.Annotations) != 1 {
+		t.Fatalf("expected annotation to be added")
+	}
+
+	if !controller.UndoEdit() {
+		t.Fatal("expected annotation undo")
+	}
+	if len(controller.Editor.Annotations) != 0 {
+		t.Fatalf("expected annotation undo, got %d annotations", len(controller.Editor.Annotations))
+	}
+	if !controller.RedoEdit() {
+		t.Fatal("expected annotation redo")
+	}
+	if len(controller.Editor.Annotations) != 1 {
+		t.Fatalf("expected annotation redo, got %d annotations", len(controller.Editor.Annotations))
+	}
+
+	if err := controller.CropCapturedImage(image.Rect(10, 5, 90, 55)); err != nil {
+		t.Fatal(err)
+	}
+	if got := controller.CapturedImage.Bounds(); got != image.Rect(0, 0, 80, 50) {
+		t.Fatalf("unexpected cropped bounds: %v", got)
+	}
+	if !controller.UndoEdit() {
+		t.Fatal("expected crop undo")
+	}
+	if got := controller.CapturedImage.Bounds(); got != image.Rect(0, 0, 120, 80) {
+		t.Fatalf("unexpected undo bounds: %v", got)
+	}
+	if got := controller.SelectedScreen; got != image.Rect(20, 10, 140, 90) {
+		t.Fatalf("unexpected undo selected screen: %v", got)
+	}
+	if got := controller.Editor.Annotations[0].Rect; got != editor.NewRect(editor.Point{X: 30, Y: 20}, editor.Point{X: 80, Y: 60}) {
+		t.Fatalf("unexpected undo annotation rect: %#v", got)
+	}
+	if !controller.RedoEdit() {
+		t.Fatal("expected crop redo")
+	}
+	if got := controller.CapturedImage.Bounds(); got != image.Rect(0, 0, 80, 50) {
+		t.Fatalf("unexpected redo bounds: %v", got)
+	}
+	if got := controller.SelectedScreen; got != image.Rect(30, 15, 110, 65) {
+		t.Fatalf("unexpected redo selected screen: %v", got)
+	}
+	if got := controller.Editor.Annotations[0].Rect; got != editor.NewRect(editor.Point{X: 20, Y: 15}, editor.Point{X: 70, Y: 55}) {
+		t.Fatalf("unexpected redo annotation rect: %#v", got)
+	}
+}
+
 func (f *fakeCapturer) Capture(rect image.Rectangle) (image.Image, error) {
 	f.gotRect = rect
 	return f.img, nil

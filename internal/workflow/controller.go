@@ -41,6 +41,16 @@ type Controller struct {
 	SelectedScreen    image.Rectangle
 
 	nextAnnotationID int
+	undoStack        []editSnapshot
+	redoStack        []editSnapshot
+}
+
+type editSnapshot struct {
+	CapturedImage     *image.RGBA
+	SelectedImageRect image.Rectangle
+	SelectedScreen    image.Rectangle
+	Editor            *editor.Editor
+	NextAnnotationID  int
 }
 
 func NewController(capturer capture.ScreenCapturer) *Controller {
@@ -110,6 +120,7 @@ func (c *Controller) BeginCaptureFromSnapshot(snapshot CaptureSnapshot) error {
 	c.SelectedImageRect = image.Rectangle{}
 	c.SelectedScreen = image.Rectangle{}
 	c.Editor = editor.NewEditor()
+	c.clearEditHistory()
 	c.Mode = ModeSelecting
 	return nil
 }
@@ -142,6 +153,7 @@ func (c *Controller) CommitImageSelection(selection image.Rectangle) error {
 		return err
 	}
 	c.Mode = ModeEditing
+	c.clearEditHistory()
 	return nil
 }
 
@@ -233,6 +245,7 @@ func (c *Controller) CommitExternalImage(screenRect image.Rectangle, img image.I
 		return err
 	}
 	c.Mode = ModeEditing
+	c.clearEditHistory()
 	return nil
 }
 
@@ -241,29 +254,60 @@ func (c *Controller) AddAnnotation(tool editor.Tool, points []editor.Point, rect
 		return fmt.Errorf("cannot annotate while mode is %s", c.Mode)
 	}
 
-	c.nextAnnotationID++
+	nextID := c.nextAnnotationID + 1
 	if tool == editor.ToolRectangle {
 		rect = rect.Normalize()
 	}
 
 	annotation := editor.Annotation{
-		ID:     fmt.Sprintf("annotation-%d", c.nextAnnotationID),
+		ID:     fmt.Sprintf("annotation-%d", nextID),
 		Tool:   tool,
 		Points: append([]editor.Point(nil), points...),
 		Rect:   rect,
 		Style:  c.styleForTool(tool),
 	}
+	if annotation.Style.Width == 0 {
+		annotation.Style = editor.DefaultStrokeStyle()
+	}
+	if err := annotation.Validate(); err != nil {
+		return err
+	}
+	c.pushEditHistory()
+	c.nextAnnotationID = nextID
 	return c.Editor.AddAnnotation(annotation)
 }
 
 func (c *Controller) UndoAnnotation() bool {
-	_, ok := c.Editor.Undo()
-	return ok
+	return c.UndoEdit()
 }
 
 func (c *Controller) RedoAnnotation() bool {
-	_, ok := c.Editor.Redo()
-	return ok
+	return c.RedoEdit()
+
+}
+
+func (c *Controller) UndoEdit() bool {
+	if len(c.undoStack) == 0 {
+		return false
+	}
+	current := c.snapshotEditState()
+	last := c.undoStack[len(c.undoStack)-1]
+	c.undoStack = c.undoStack[:len(c.undoStack)-1]
+	c.redoStack = append(c.redoStack, current)
+	c.restoreEditState(last)
+	return true
+}
+
+func (c *Controller) RedoEdit() bool {
+	if len(c.redoStack) == 0 {
+		return false
+	}
+	current := c.snapshotEditState()
+	next := c.redoStack[len(c.redoStack)-1]
+	c.redoStack = c.redoStack[:len(c.redoStack)-1]
+	c.undoStack = append(c.undoStack, current)
+	c.restoreEditState(next)
+	return true
 }
 
 func (c *Controller) styleForTool(tool editor.Tool) editor.StrokeStyle {
@@ -300,6 +344,7 @@ func (c *Controller) CropCapturedImage(rect image.Rectangle) error {
 		return nil
 	}
 
+	c.pushEditHistory()
 	c.CapturedImage = cropImage(c.CapturedImage, rect)
 	c.SelectedImageRect = image.Rectangle{Min: c.SelectedImageRect.Min.Add(rect.Min), Max: c.SelectedImageRect.Min.Add(rect.Max)}
 	c.SelectedScreen = image.Rectangle{Min: c.SelectedScreen.Min.Add(rect.Min), Max: c.SelectedScreen.Min.Add(rect.Max)}
@@ -308,6 +353,63 @@ func (c *Controller) CropCapturedImage(rect image.Rectangle) error {
 		c.Editor.TranslateAnnotations(editor.Point{X: -rect.Min.X, Y: -rect.Min.Y})
 	}
 	return nil
+}
+
+func (c *Controller) pushEditHistory() {
+	c.undoStack = append(c.undoStack, c.snapshotEditState())
+	c.redoStack = nil
+}
+
+func (c *Controller) clearEditHistory() {
+	c.undoStack = nil
+	c.redoStack = nil
+}
+
+func (c *Controller) snapshotEditState() editSnapshot {
+	return editSnapshot{
+		CapturedImage:     cloneRGBA(c.CapturedImage),
+		SelectedImageRect: c.SelectedImageRect,
+		SelectedScreen:    c.SelectedScreen,
+		Editor:            cloneEditor(c.Editor),
+		NextAnnotationID:  c.nextAnnotationID,
+	}
+}
+
+func (c *Controller) restoreEditState(snapshot editSnapshot) {
+	c.CapturedImage = cloneRGBA(snapshot.CapturedImage)
+	c.SelectedImageRect = snapshot.SelectedImageRect
+	c.SelectedScreen = snapshot.SelectedScreen
+	c.Editor = cloneEditor(snapshot.Editor)
+	c.nextAnnotationID = snapshot.NextAnnotationID
+}
+
+func cloneEditor(src *editor.Editor) *editor.Editor {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+	dst.Annotations = cloneAnnotations(src.Annotations)
+	dst.RedoStack = cloneAnnotations(src.RedoStack)
+	return &dst
+}
+
+func cloneAnnotations(src []editor.Annotation) []editor.Annotation {
+	if src == nil {
+		return nil
+	}
+	dst := make([]editor.Annotation, len(src))
+	for i := range src {
+		dst[i] = src[i]
+		dst[i].Points = append([]editor.Point(nil), src[i].Points...)
+	}
+	return dst
+}
+
+func cloneRGBA(src image.Image) *image.RGBA {
+	if src == nil {
+		return nil
+	}
+	return cropImage(src, src.Bounds())
 }
 
 func (c *Controller) CopyPNG() error {

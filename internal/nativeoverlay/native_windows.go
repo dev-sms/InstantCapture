@@ -170,6 +170,8 @@ type nativeSession struct {
 	winWidth  int
 	winHeight int
 	bgra      []byte
+	original  []byte
+	highlight []byte
 	bmi       bitmapInfo
 	hasCursor bool
 	cursor    image.Point
@@ -177,9 +179,14 @@ type nativeSession struct {
 	start     image.Point
 	current   image.Point
 	mode      string
-	windows   []image.Rectangle
-	hover     image.Rectangle
+	windows   []nativeWindow
+	hover     int
 	polygon   []image.Point
+}
+
+type nativeWindow struct {
+	rect         image.Rectangle
+	visibleRects []image.Rectangle
 }
 
 func selectNative(ctx context.Context, img image.Image, opt overlay.Options) (Selection, bool, error) {
@@ -213,10 +220,30 @@ func selectNative(ctx context.Context, img image.Image, opt overlay.Options) (Se
 		return Selection{}, false, err
 	}
 	session.mode = opt.CaptureMode
-	for _, rect := range opt.WindowRects {
-		imageRect := rect.Sub(virtualScreen.Min).Intersect(session.imgBounds)
-		if !imageRect.Empty() {
-			session.windows = append(session.windows, imageRect)
+	if len(opt.WindowRegions) > 0 {
+		for _, region := range opt.WindowRegions {
+			imageRect := region.Rect.Sub(virtualScreen.Min).Intersect(session.imgBounds)
+			if imageRect.Empty() {
+				continue
+			}
+			visibleRects := make([]image.Rectangle, 0, len(region.VisibleRects))
+			for _, visible := range region.VisibleRects {
+				visibleRect := visible.Sub(virtualScreen.Min).Intersect(session.imgBounds)
+				if !visibleRect.Empty() {
+					visibleRects = append(visibleRects, visibleRect)
+				}
+			}
+			if len(visibleRects) == 0 {
+				continue
+			}
+			session.windows = append(session.windows, nativeWindow{rect: imageRect, visibleRects: visibleRects})
+		}
+	} else {
+		for _, rect := range opt.WindowRects {
+			imageRect := rect.Sub(virtualScreen.Min).Intersect(session.imgBounds)
+			if !imageRect.Empty() {
+				session.windows = append(session.windows, nativeWindow{rect: imageRect, visibleRects: []image.Rectangle{imageRect}})
+			}
 		}
 	}
 
@@ -310,6 +337,7 @@ func newNativeSession(img image.Image, virtualScreen image.Rectangle, dimAlpha u
 	rgba := image.NewRGBA(image.Rect(0, 0, img.Bounds().Dx(), img.Bounds().Dy()))
 	draw.Draw(rgba, rgba.Bounds(), img, img.Bounds().Min, draw.Src)
 	bgra := make([]byte, rgba.Bounds().Dx()*rgba.Bounds().Dy()*4)
+	original := make([]byte, len(bgra))
 	dim := 1 - (float64(dimAlpha)/255.0)*0.65
 	if dim < 0.2 {
 		dim = 0.2
@@ -318,10 +346,14 @@ func newNativeSession(img image.Image, virtualScreen image.Rectangle, dimAlpha u
 		for x := 0; x < rgba.Bounds().Dx(); x++ {
 			src := rgba.PixOffset(x, y)
 			dst := (y*rgba.Bounds().Dx() + x) * 4
-			bgra[dst+0] = uint8(float64(rgba.Pix[src+2]) * dim)
-			bgra[dst+1] = uint8(float64(rgba.Pix[src+1]) * dim)
-			bgra[dst+2] = uint8(float64(rgba.Pix[src+0]) * dim)
-			bgra[dst+3] = rgba.Pix[src+3]
+			original[dst+0] = rgba.Pix[src+2]
+			original[dst+1] = rgba.Pix[src+1]
+			original[dst+2] = rgba.Pix[src+0]
+			original[dst+3] = rgba.Pix[src+3]
+			bgra[dst+0] = uint8(float64(original[dst+0]) * dim)
+			bgra[dst+1] = uint8(float64(original[dst+1]) * dim)
+			bgra[dst+2] = uint8(float64(original[dst+2]) * dim)
+			bgra[dst+3] = original[dst+3]
 		}
 	}
 	bmi := bitmapInfo{}
@@ -339,7 +371,10 @@ func newNativeSession(img image.Image, virtualScreen image.Rectangle, dimAlpha u
 		winWidth:  virtualScreen.Dx(),
 		winHeight: virtualScreen.Dy(),
 		bgra:      bgra,
+		original:  original,
+		highlight: make([]byte, len(bgra)),
 		bmi:       bmi,
+		hover:     -1,
 	}, nil
 }
 
@@ -356,8 +391,8 @@ func nativeWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	case wmLButtonDown:
 		if s != nil {
 			if s.mode == "Window" {
-				if !s.hover.Empty() {
-					s.finish(Selection{Rect: s.hover}, true, nil)
+				if s.hover >= 0 && s.hover < len(s.windows) {
+					s.finish(Selection{Rect: s.windows[s.hover].rect}, true, nil)
 					procDestroyWindow.Call(hwnd)
 				}
 				return 0
@@ -459,11 +494,15 @@ func (s *nativeSession) paint(hwnd uintptr) {
 	if w <= 0 || h <= 0 || len(s.bgra) == 0 {
 		return
 	}
+	bgra := s.paintBuffer()
+	if len(bgra) == 0 {
+		return
+	}
 	procStretchDIBits.Call(
 		hdc,
 		0, 0, uintptr(w), uintptr(h),
 		0, 0, uintptr(s.imgBounds.Dx()), uintptr(s.imgBounds.Dy()),
-		uintptr(unsafe.Pointer(&s.bgra[0])),
+		uintptr(unsafe.Pointer(&bgra[0])),
 		uintptr(unsafe.Pointer(&s.bmi)),
 		uintptr(dibRGBColors),
 		uintptr(srcCopy),
@@ -472,9 +511,6 @@ func (s *nativeSession) paint(hwnd uintptr) {
 		s.drawCrosshair(hdc, w, h)
 		s.drawMagnifier(hdc, w, h)
 	}
-	if s.mode == "Window" && !s.hover.Empty() {
-		s.drawRect(hdc, w, h, s.hover, colorRef(34, 211, 238), 5)
-	}
 	if s.selecting {
 		if s.mode == "Freeform" {
 			s.drawFreeform(hdc, w, h)
@@ -482,6 +518,26 @@ func (s *nativeSession) paint(hwnd uintptr) {
 			s.drawSelection(hdc, w, h)
 		}
 	}
+}
+
+func (s *nativeSession) paintBuffer() []byte {
+	if s.mode != "Window" || s.hover < 0 || s.hover >= len(s.windows) || len(s.original) != len(s.bgra) || len(s.highlight) != len(s.bgra) {
+		return s.bgra
+	}
+	copy(s.highlight, s.bgra)
+	stride := max(1, s.imgBounds.Dx()) * 4
+	for _, rect := range s.windows[s.hover].visibleRects {
+		rect = rect.Intersect(s.imgBounds)
+		if rect.Empty() {
+			continue
+		}
+		rowBytes := rect.Dx() * 4
+		for y := rect.Min.Y; y < rect.Max.Y; y++ {
+			start := y*stride + rect.Min.X*4
+			copy(s.highlight[start:start+rowBytes], s.original[start:start+rowBytes])
+		}
+	}
+	return s.highlight
 }
 
 func (s *nativeSession) clientRect(hwnd uintptr) nativeRect {
@@ -502,10 +558,7 @@ func (s *nativeSession) drawSelection(hdc uintptr, clientW, clientH int) {
 }
 
 func (s *nativeSession) drawRect(hdc uintptr, clientW, clientH int, rect image.Rectangle, c uint32, width int) {
-	left := rect.Min.X * clientW / s.imgBounds.Dx()
-	top := rect.Min.Y * clientH / s.imgBounds.Dy()
-	right := rect.Max.X * clientW / s.imgBounds.Dx()
-	bottom := rect.Max.Y * clientH / s.imgBounds.Dy()
+	left, top, right, bottom := s.clientRectForImageRect(rect, clientW, clientH)
 	pen, _, _ := procCreatePen.Call(uintptr(psSolid), uintptr(width), uintptr(c))
 	if pen == 0 {
 		return
@@ -521,6 +574,14 @@ func (s *nativeSession) drawRect(hdc uintptr, clientW, clientH int, rect image.R
 	if oldPen != 0 {
 		procSelectObject.Call(hdc, oldPen)
 	}
+}
+
+func (s *nativeSession) clientRectForImageRect(rect image.Rectangle, clientW, clientH int) (int, int, int, int) {
+	left := rect.Min.X * clientW / max(1, s.imgBounds.Dx())
+	top := rect.Min.Y * clientH / max(1, s.imgBounds.Dy())
+	right := rect.Max.X * clientW / max(1, s.imgBounds.Dx())
+	bottom := rect.Max.Y * clientH / max(1, s.imgBounds.Dy())
+	return left, top, right, bottom
 }
 
 func (s *nativeSession) drawFreeform(hdc uintptr, clientW, clientH int) {
@@ -549,19 +610,15 @@ func (s *nativeSession) drawFreeform(hdc uintptr, clientW, clientH int) {
 	}
 }
 
-func (s *nativeSession) windowAt(p image.Point) image.Rectangle {
-	best := image.Rectangle{}
-	bestArea := 0
-	for _, rect := range s.windows {
-		if p.In(rect) {
-			area := rect.Dx() * rect.Dy()
-			if best.Empty() || area < bestArea {
-				best = rect
-				bestArea = area
+func (s *nativeSession) windowAt(p image.Point) int {
+	for i, window := range s.windows {
+		for _, rect := range window.visibleRects {
+			if p.In(rect) {
+				return i
 			}
 		}
 	}
-	return best
+	return -1
 }
 
 func appendPointIfFar(points []image.Point, p image.Point) []image.Point {
