@@ -1,0 +1,376 @@
+package workflow
+
+import (
+	"fmt"
+	"image"
+	"image/draw"
+	"os"
+	"path/filepath"
+	"time"
+
+	"instantcapture/internal/capture"
+	"instantcapture/internal/editor"
+	"instantcapture/internal/exporter"
+)
+
+type Mode string
+
+const (
+	ModeIdle      Mode = "idle"
+	ModeSelecting Mode = "selecting"
+	ModeEditing   Mode = "editing"
+)
+
+type CaptureSnapshot struct {
+	VirtualScreen image.Rectangle
+	Displays      []image.Rectangle
+	Image         image.Image
+}
+
+type Controller struct {
+	Capturer         capture.ScreenCapturer
+	Editor           *editor.Editor
+	AnnotationStyle  editor.StrokeStyle
+	HighlighterStyle editor.StrokeStyle
+
+	Mode              Mode
+	VirtualScreen     image.Rectangle
+	FullScreenImage   image.Image
+	CapturedImage     image.Image
+	SelectedImageRect image.Rectangle
+	SelectedScreen    image.Rectangle
+
+	nextAnnotationID int
+}
+
+func NewController(capturer capture.ScreenCapturer) *Controller {
+	return &Controller{
+		Capturer:         capturer,
+		Editor:           editor.NewEditor(),
+		AnnotationStyle:  editor.DefaultStrokeStyle(),
+		HighlighterStyle: editor.StrokeStyle{ColorRGBA: [4]uint8{250, 204, 21, 180}, Width: 14},
+		Mode:             ModeIdle,
+	}
+}
+
+func (c *Controller) BeginCapture() error {
+	if c.Capturer == nil {
+		return fmt.Errorf("screen capturer is nil")
+	}
+	snapshot, err := CaptureScreen(c.Capturer)
+	if err != nil {
+		return err
+	}
+	return c.BeginCaptureFromSnapshot(snapshot)
+}
+
+func CaptureScreen(capturer capture.ScreenCapturer) (CaptureSnapshot, error) {
+	if capturer == nil {
+		return CaptureSnapshot{}, fmt.Errorf("screen capturer is nil")
+	}
+	displays := capturer.Displays()
+	virtualScreen := capture.UnionDisplays(displays)
+	if virtualScreen.Empty() {
+		return CaptureSnapshot{}, fmt.Errorf("no active displays found")
+	}
+
+	stitched, err := captureDisplays(capturer, virtualScreen, displays)
+	if err != nil {
+		return CaptureSnapshot{}, fmt.Errorf("capture displays: %w", err)
+	}
+	return CaptureSnapshot{VirtualScreen: virtualScreen, Displays: displays, Image: stitched}, nil
+}
+
+func captureDisplays(capturer capture.ScreenCapturer, virtualScreen image.Rectangle, displays []image.Rectangle) (image.Image, error) {
+	canvas := image.NewRGBA(image.Rect(0, 0, virtualScreen.Dx(), virtualScreen.Dy()))
+	for _, display := range displays {
+		if display.Empty() {
+			continue
+		}
+		img, err := capturer.Capture(display)
+		if err != nil {
+			return nil, err
+		}
+		dst := display.Sub(virtualScreen.Min)
+		draw.Draw(canvas, dst, img, img.Bounds().Min, draw.Src)
+	}
+	return canvas, nil
+}
+
+func (c *Controller) BeginCaptureFromSnapshot(snapshot CaptureSnapshot) error {
+	if snapshot.VirtualScreen.Empty() {
+		return fmt.Errorf("snapshot virtual screen is empty")
+	}
+	if snapshot.Image == nil {
+		return fmt.Errorf("snapshot image is nil")
+	}
+	c.VirtualScreen = snapshot.VirtualScreen
+	c.FullScreenImage = normalizeImage(snapshot.Image)
+	c.CapturedImage = nil
+	c.SelectedImageRect = image.Rectangle{}
+	c.SelectedScreen = image.Rectangle{}
+	c.Editor = editor.NewEditor()
+	c.Mode = ModeSelecting
+	return nil
+}
+
+func (c *Controller) CommitImageSelection(selection image.Rectangle) error {
+	if c.Mode != ModeSelecting {
+		return fmt.Errorf("cannot commit selection while mode is %s", c.Mode)
+	}
+	if c.FullScreenImage == nil {
+		return fmt.Errorf("full screen image is nil")
+	}
+
+	selection = selection.Canon().Intersect(c.FullScreenImage.Bounds())
+	if selection.Empty() {
+		return fmt.Errorf("selection is empty")
+	}
+
+	c.CapturedImage = cropImage(c.FullScreenImage, selection)
+	c.SelectedImageRect = selection
+	c.SelectedScreen = selection.Add(c.VirtualScreen.Min)
+	c.Editor = editor.NewEditor()
+	c.Editor.BeginSelection(editor.Point{X: selection.Min.X, Y: selection.Min.Y})
+	if err := c.Editor.UpdateSelection(editor.Point{X: selection.Max.X, Y: selection.Max.Y}); err != nil {
+		return err
+	}
+	if _, err := c.Editor.CommitSelection(); err != nil {
+		return err
+	}
+	if err := c.Editor.StartEditing(); err != nil {
+		return err
+	}
+	c.Mode = ModeEditing
+	return nil
+}
+
+func (c *Controller) CommitFreeformSelection(selection image.Rectangle, polygon []image.Point) error {
+	if err := c.CommitImageSelection(selection); err != nil {
+		return err
+	}
+	if len(polygon) < 3 {
+		return nil
+	}
+	rgba, ok := c.CapturedImage.(*image.RGBA)
+	if !ok {
+		return nil
+	}
+	local := make([]image.Point, 0, len(polygon))
+	for _, p := range polygon {
+		local = append(local, p.Sub(selection.Min))
+	}
+	applyPolygonAlphaMask(rgba, local)
+	return nil
+}
+
+func (c *Controller) CommitFullScreenSelection() error {
+	if c.FullScreenImage == nil {
+		return fmt.Errorf("full screen image is nil")
+	}
+	return c.CommitImageSelection(c.FullScreenImage.Bounds())
+}
+
+func (c *Controller) CommitScreenSelection(screenRect image.Rectangle) error {
+	imageRect := screenRect.Sub(c.VirtualScreen.Min)
+	return c.CommitImageSelection(imageRect)
+}
+
+func (c *Controller) CommitScreenCapture(screenRect image.Rectangle) error {
+	if c.Capturer == nil {
+		return fmt.Errorf("screen capturer is nil")
+	}
+	img, err := c.Capturer.Capture(screenRect)
+	if err != nil {
+		return fmt.Errorf("capture selected screen rect: %w", err)
+	}
+	return c.CommitExternalImage(screenRect, img)
+}
+
+func (c *Controller) CommitFreeformScreenCapture(selection image.Rectangle, polygon []image.Point) error {
+	screenRect := selection.Add(c.VirtualScreen.Min)
+	if err := c.CommitScreenCapture(screenRect); err != nil {
+		return err
+	}
+	rgba, ok := c.CapturedImage.(*image.RGBA)
+	if ok && len(polygon) >= 3 {
+		local := make([]image.Point, 0, len(polygon))
+		for _, p := range polygon {
+			local = append(local, p.Sub(selection.Min))
+		}
+		applyPolygonAlphaMask(rgba, local)
+	}
+	return nil
+}
+
+func applyPolygonAlphaMask(rgba *image.RGBA, local []image.Point) {
+	for y := 0; y < rgba.Bounds().Dy(); y++ {
+		for x := 0; x < rgba.Bounds().Dx(); x++ {
+			if !pointInPolygon(image.Pt(x, y), local) {
+				off := rgba.PixOffset(x, y)
+				rgba.Pix[off+3] = 0
+			}
+		}
+	}
+}
+
+func (c *Controller) CommitExternalImage(screenRect image.Rectangle, img image.Image) error {
+	if img == nil {
+		return fmt.Errorf("external image is nil")
+	}
+	c.CapturedImage = normalizeImage(img)
+	c.SelectedScreen = screenRect
+	c.SelectedImageRect = screenRect.Sub(c.VirtualScreen.Min)
+	c.Editor = editor.NewEditor()
+	c.Editor.BeginSelection(editor.Point{X: 0, Y: 0})
+	if err := c.Editor.UpdateSelection(editor.Point{X: c.CapturedImage.Bounds().Dx(), Y: c.CapturedImage.Bounds().Dy()}); err != nil {
+		return err
+	}
+	if _, err := c.Editor.CommitSelection(); err != nil {
+		return err
+	}
+	if err := c.Editor.StartEditing(); err != nil {
+		return err
+	}
+	c.Mode = ModeEditing
+	return nil
+}
+
+func (c *Controller) AddAnnotation(tool editor.Tool, points []editor.Point, rect editor.Rect) error {
+	if c.Mode != ModeEditing {
+		return fmt.Errorf("cannot annotate while mode is %s", c.Mode)
+	}
+
+	c.nextAnnotationID++
+	if tool == editor.ToolRectangle {
+		rect = rect.Normalize()
+	}
+
+	annotation := editor.Annotation{
+		ID:     fmt.Sprintf("annotation-%d", c.nextAnnotationID),
+		Tool:   tool,
+		Points: append([]editor.Point(nil), points...),
+		Rect:   rect,
+		Style:  c.styleForTool(tool),
+	}
+	return c.Editor.AddAnnotation(annotation)
+}
+
+func (c *Controller) UndoAnnotation() bool {
+	_, ok := c.Editor.Undo()
+	return ok
+}
+
+func (c *Controller) RedoAnnotation() bool {
+	_, ok := c.Editor.Redo()
+	return ok
+}
+
+func (c *Controller) styleForTool(tool editor.Tool) editor.StrokeStyle {
+	style := c.AnnotationStyle
+	if tool == editor.ToolHighlight {
+		style = c.HighlighterStyle
+	} else {
+		style.ColorRGBA[3] = 255
+	}
+	return style
+}
+
+func (c *Controller) RenderedImage() (*image.RGBA, error) {
+	if c.CapturedImage == nil {
+		return nil, fmt.Errorf("captured image is nil")
+	}
+	return exporter.RenderAnnotations(c.CapturedImage, c.Editor.RenderCommands())
+}
+
+func (c *Controller) CropCapturedImage(rect image.Rectangle) error {
+	if c.Mode != ModeEditing {
+		return fmt.Errorf("cannot crop while mode is %s", c.Mode)
+	}
+	if c.CapturedImage == nil {
+		return fmt.Errorf("captured image is nil")
+	}
+
+	bounds := image.Rectangle{Max: c.CapturedImage.Bounds().Size()}
+	rect = rect.Canon().Intersect(bounds)
+	if rect.Empty() {
+		return fmt.Errorf("crop rectangle is empty")
+	}
+	if rect.Eq(bounds) {
+		return nil
+	}
+
+	c.CapturedImage = cropImage(c.CapturedImage, rect)
+	c.SelectedImageRect = image.Rectangle{Min: c.SelectedImageRect.Min.Add(rect.Min), Max: c.SelectedImageRect.Min.Add(rect.Max)}
+	c.SelectedScreen = image.Rectangle{Min: c.SelectedScreen.Min.Add(rect.Min), Max: c.SelectedScreen.Min.Add(rect.Max)}
+	if c.Editor != nil {
+		c.Editor.Selection = editor.Rect{Min: editor.Point{}, Max: editor.Point{X: rect.Dx(), Y: rect.Dy()}}
+		c.Editor.TranslateAnnotations(editor.Point{X: -rect.Min.X, Y: -rect.Min.Y})
+	}
+	return nil
+}
+
+func (c *Controller) CopyPNG() error {
+	img, err := c.RenderedImage()
+	if err != nil {
+		return err
+	}
+	return exporter.CopyPNG(img)
+}
+
+func (c *Controller) SavePNG(dir string) (string, error) {
+	img, err := c.RenderedImage()
+	if err != nil {
+		return "", err
+	}
+	if dir == "" {
+		dir = "."
+	}
+	path := nextSavePath(dir, time.Now())
+	return path, exporter.SavePNG(path, img)
+}
+
+func nextSavePath(dir string, now time.Time) string {
+	base := "InstantCapture_" + now.Format("20060102_150405")
+	path := filepath.Join(dir, base+".png")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return path
+	}
+
+	for i := 1; ; i++ {
+		candidate := filepath.Join(dir, fmt.Sprintf("%s_%02d.png", base, i))
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
+}
+
+func normalizeImage(src image.Image) *image.RGBA {
+	if src == nil {
+		return nil
+	}
+	return cropImage(src, src.Bounds())
+}
+
+func cropImage(src image.Image, rect image.Rectangle) *image.RGBA {
+	dst := image.NewRGBA(image.Rect(0, 0, rect.Dx(), rect.Dy()))
+	draw.Draw(dst, dst.Bounds(), src, rect.Min, draw.Src)
+	return dst
+}
+
+func pointInPolygon(p image.Point, poly []image.Point) bool {
+	inside := false
+	j := len(poly) - 1
+	for i := range poly {
+		pi := poly[i]
+		pj := poly[j]
+		if (pi.Y > p.Y) != (pj.Y > p.Y) {
+			x := float64(pj.X-pi.X)*float64(p.Y-pi.Y)/float64(pj.Y-pi.Y) + float64(pi.X)
+			if float64(p.X) < x {
+				inside = !inside
+			}
+		}
+		j = i
+	}
+	return inside
+}
