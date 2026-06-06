@@ -74,6 +74,7 @@ type uiEditHistoryEntry struct {
 }
 
 type overlayResult struct {
+	mode      string
 	selection nativeoverlay.Selection
 	ok        bool
 	err       error
@@ -84,6 +85,12 @@ type captureStartResult struct {
 	snapshot      workflow.CaptureSnapshot
 	windowTargets []platformwindows.WindowTarget
 	err           error
+}
+
+type scrollCaptureResult struct {
+	target platformwindows.WindowTarget
+	img    image.Image
+	err    error
 }
 
 type windowUI struct {
@@ -101,10 +108,14 @@ type windowUI struct {
 	saveButton           widget.Clickable
 	settingsButton       widget.Clickable
 	captureModeButton    widget.Clickable
-	captureModeItems     [4]widget.Clickable
+	captureModeItems     [5]widget.Clickable
 	hotkeyButton         widget.Clickable
 	hideMinButton        widget.Clickable
 	hideFocusButton      widget.Clickable
+	autoSaveButton       widget.Clickable
+	saveDirEditor        widget.Editor
+	saveDirApplyButton   widget.Clickable
+	saveDirBrowseButton  widget.Clickable
 	strokeColorButton    widget.Clickable
 	strokeWidthButton    widget.Clickable
 	paletteButtons       [5]widget.Clickable
@@ -114,6 +125,7 @@ type windowUI struct {
 	highlightWidthSlider widget.Float
 	highlightAlphaSlider widget.Float
 	rgbInitialized       bool
+	saveDirInitialized   bool
 
 	canvasTag struct{}
 	keyTag    struct{}
@@ -138,6 +150,7 @@ type windowUI struct {
 	overlayResults chan overlayResult
 	captureActive  bool
 	captureResults chan captureStartResult
+	scrollResults  chan scrollCaptureResult
 	windowTargets  []platformwindows.WindowTarget
 
 	dragging   bool
@@ -185,6 +198,7 @@ func RunMainWindow(ctx context.Context) error {
 		suppressFocusLossUntil: time.Now().Add(2 * time.Second),
 		overlayResults:         make(chan overlayResult, 1),
 		captureResults:         make(chan captureStartResult, 1),
+		scrollResults:          make(chan scrollCaptureResult, 1),
 		activeTool:             editor.ToolRectangle,
 	}
 	ui.applyStrokeStyle()
@@ -259,6 +273,8 @@ func RunMainWindow(ctx context.Context) error {
 			ui.beginCapture(w)
 		case result := <-ui.captureResults:
 			ui.handleCaptureStartResult(result, w)
+		case result := <-ui.scrollResults:
+			ui.handleScrollCaptureResult(result)
 		case <-focusLossEvents:
 			if uShouldHideForFocusLoss(ui) {
 				ui.hideToTray("Hidden to tray after focus loss.", w)
@@ -440,7 +456,7 @@ func (u *windowUI) showToastDetail(title, message string) {
 func (u *windowUI) layoutModeDropdown(gtx layout.Context) layout.Dimensions {
 	paint.FillShape(gtx.Ops, color.NRGBA{R: 11, G: 18, B: 34, A: 255}, clip.Rect{Max: gtx.Constraints.Max}.Op())
 	return layout.Inset{Top: unit.Dp(8), Bottom: unit.Dp(8), Left: unit.Dp(150), Right: unit.Dp(16)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		modes := []string{"Region", "Window", "Freeform", "Fullscreen"}
+		modes := []string{"Region", "Window", "Scroll", "Freeform", "Fullscreen"}
 		children := make([]layout.FlexChild, 0, len(modes))
 		for i := range modes {
 			idx := i
@@ -478,10 +494,42 @@ func (u *windowUI) layoutSettings(gtx layout.Context) layout.Dimensions {
 				return u.layoutStyleSettings(gtx)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return u.layoutSaveSettings(gtx)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return u.layoutHighlighterSettings(gtx)
 			}),
 		)
 	})
+}
+
+func (u *windowUI) layoutSaveSettings(gtx layout.Context) layout.Dimensions {
+	if !u.saveDirInitialized {
+		u.saveDirEditor.SingleLine = true
+		u.saveDirEditor.SetText(u.configuredSaveDir())
+		u.saveDirInitialized = true
+	}
+	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Gap: gtx.Dp(unit.Dp(10))}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			label := material.Body2(u.theme, "Save")
+			label.Color = color.NRGBA{R: 148, G: 163, B: 184, A: 255}
+			return label.Layout(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return toggleButton(u.theme, &u.autoSaveButton, "Auto save: "+onOff(u.appConfig.AutoSave), u.appConfig.AutoSave).Layout(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			gtx.Constraints.Min.X = gtx.Dp(unit.Dp(430))
+			gtx.Constraints.Max.X = gtx.Dp(unit.Dp(430))
+			return material.Editor(u.theme, &u.saveDirEditor, "Save folder").Layout(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return neutralButton(u.theme, &u.saveDirApplyButton, "Apply").Layout(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return neutralButton(u.theme, &u.saveDirBrowseButton, "Browse...").Layout(gtx)
+		}),
+	)
 }
 
 func (u *windowUI) layoutStyleSettings(gtx layout.Context) layout.Dimensions {
@@ -905,7 +953,7 @@ func nextStrokeWidth(current int) int {
 
 func validCaptureMode(mode string) bool {
 	switch mode {
-	case "Region", "Window", "Freeform", "Fullscreen":
+	case "Region", "Window", "Scroll", "Freeform", "Fullscreen":
 		return true
 	default:
 		return false
@@ -913,7 +961,7 @@ func validCaptureMode(mode string) bool {
 }
 
 func nextCaptureMode(current string) string {
-	modes := []string{"Region", "Window", "Freeform", "Fullscreen"}
+	modes := []string{"Region", "Window", "Scroll", "Freeform", "Fullscreen"}
 	for i, mode := range modes {
 		if mode == current {
 			return modes[(i+1)%len(modes)]
@@ -942,7 +990,7 @@ func (u *windowUI) layoutCanvas(gtx layout.Context, w *app.Window) layout.Dimens
 	case workflow.ModeSelecting:
 		img = u.controller.FullScreenImage
 	case workflow.ModeEditing:
-		rendered, err := u.controller.RenderedImage()
+		rendered, err := u.controller.PreviewImage()
 		if err != nil {
 			u.status = "Render failed: " + err.Error()
 			img = u.controller.CapturedImage
@@ -1057,7 +1105,7 @@ func (u *windowUI) handleButtons(gtx layout.Context, w *app.Window) {
 			u.showSettings = false
 		}
 	}
-	for i, mode := range []string{"Region", "Window", "Freeform", "Fullscreen"} {
+	for i, mode := range []string{"Region", "Window", "Scroll", "Freeform", "Fullscreen"} {
 		for u.captureModeItems[i].Clicked(gtx) {
 			u.appConfig.CaptureMode = mode
 			u.showModeDropdown = false
@@ -1074,6 +1122,16 @@ func (u *windowUI) handleButtons(gtx layout.Context, w *app.Window) {
 	for u.hideFocusButton.Clicked(gtx) {
 		u.appConfig.HideOnFocusLoss = !u.appConfig.HideOnFocusLoss
 		u.saveConfigStatus("Focus-loss tray changed: " + onOff(u.appConfig.HideOnFocusLoss))
+	}
+	for u.autoSaveButton.Clicked(gtx) {
+		u.appConfig.AutoSave = !u.appConfig.AutoSave
+		u.saveConfigStatus("Auto save changed: " + onOff(u.appConfig.AutoSave))
+	}
+	for u.saveDirApplyButton.Clicked(gtx) {
+		u.applySaveDirText()
+	}
+	for u.saveDirBrowseButton.Clicked(gtx) {
+		u.chooseSaveDir()
 	}
 	for i, preset := range strokePresets() {
 		for u.paletteButtons[i].Clicked(gtx) {
@@ -1092,55 +1150,135 @@ func (u *windowUI) handleButtons(gtx layout.Context, w *app.Window) {
 }
 
 func (u *windowUI) handleShortcuts(gtx layout.Context) {
-	if shortcutPressed(gtx, &u.keyTag, key.Modifiers(0), key.NameEscape) {
+	filters := []event.Filter{
+		key.Filter{Name: key.NameEscape},
+		key.Filter{Name: "S", Required: key.ModShortcut},
+		key.Filter{Name: "s", Required: key.ModShortcut},
+		key.Filter{Name: "C", Required: key.ModShortcut},
+		key.Filter{Name: "c", Required: key.ModShortcut},
+		key.Filter{Name: "Z", Required: key.ModShortcut, Optional: key.ModShift},
+		key.Filter{Name: "z", Required: key.ModShortcut, Optional: key.ModShift},
+		key.Filter{Name: "Y", Required: key.ModShortcut},
+		key.Filter{Name: "y", Required: key.ModShortcut},
+		key.Filter{Name: "", Required: key.ModShortcut, Optional: key.ModShift},
+	}
+	for {
+		ev, ok := gtx.Event(filters...)
+		if !ok {
+			break
+		}
+		ke, ok := ev.(key.Event)
+		if !ok || ke.State != key.Press {
+			continue
+		}
+		u.handleShortcutKey(ke)
+	}
+}
+
+func (u *windowUI) handleShortcutKey(ke key.Event) bool {
+	switch strings.ToUpper(string(ke.Name)) {
+	case string(key.NameEscape):
 		u.dragging = false
 		u.cropDragging = false
 		u.status = "Current gesture canceled."
-	}
-	if shortcutPressed(gtx, &u.keyTag, key.ModCtrl, key.Name("S"), key.Name("s")) {
-		u.saveCurrentImage()
-	}
-	if shortcutPressed(gtx, &u.keyTag, key.ModCtrl, key.Name("C"), key.Name("c")) {
-		u.copyCurrentImage()
-	}
-	if shortcutPressed(gtx, &u.keyTag, key.ModCtrl|key.ModShift, key.Name("Z"), key.Name("z")) {
-		u.redoEdit()
-	}
-	if shortcutPressed(gtx, &u.keyTag, key.ModCtrl, key.Name("Z"), key.Name("z")) {
-		u.undoEdit()
-	}
-	if shortcutPressed(gtx, &u.keyTag, key.ModCtrl, key.Name("Y"), key.Name("y")) {
-		u.redoEdit()
-	}
-}
-
-func shortcutPressed(gtx layout.Context, focus event.Tag, required key.Modifiers, names ...key.Name) bool {
-	pressed := false
-	for _, name := range names {
-		for {
-			ev, ok := gtx.Event(key.Filter{Focus: focus, Required: required, Name: name})
-			if !ok {
-				break
+		return true
+	case "S":
+		if ke.Modifiers.Contain(key.ModShortcut) {
+			u.saveCurrentImage()
+			return true
+		}
+	case "C":
+		if ke.Modifiers.Contain(key.ModShortcut) {
+			u.copyCurrentImage()
+			return true
+		}
+	case "Z":
+		if ke.Modifiers.Contain(key.ModShortcut) {
+			if ke.Modifiers.Contain(key.ModShift) {
+				u.redoEdit()
+			} else {
+				u.undoEdit()
 			}
-			ke, ok := ev.(key.Event)
-			if ok && ke.State == key.Press {
-				pressed = true
-			}
+			return true
+		}
+	case "Y":
+		if ke.Modifiers.Contain(key.ModShortcut) {
+			u.redoEdit()
+			return true
 		}
 	}
-	return pressed
+	return false
 }
 
 func (u *windowUI) saveCurrentImage() {
-	dir := defaultSaveDir()
+	path, err := u.saveCurrentImageWithStatus("Saved PNG")
+	if err == nil {
+		u.status = "Saved: " + path
+	}
+}
+
+func (u *windowUI) saveCurrentImageWithStatus(toastTitle string) (string, error) {
+	dir := u.configuredSaveDir()
 	path, err := u.controller.SavePNG(dir)
 	if err != nil {
 		u.status = "Save failed: " + err.Error()
 		u.showToastDetail("Save failed", err.Error())
-	} else {
-		u.status = "Saved: " + path
-		u.showToastDetail("Saved PNG", toastSavePath(path))
+		return "", err
 	}
+	u.showToastDetail(toastTitle, toastSavePath(path))
+	return path, nil
+}
+
+func (u *windowUI) autoSaveCurrentImage() {
+	if !u.appConfig.AutoSave {
+		return
+	}
+	path, err := u.saveCurrentImageWithStatus("Auto-saved PNG")
+	if err != nil {
+		return
+	}
+	u.status = "Auto-saved: " + path
+}
+
+func (u *windowUI) configuredSaveDir() string {
+	return resolveSaveDir(u.appConfig, defaultSaveDir())
+}
+
+func resolveSaveDir(cfg config.Config, fallback string) string {
+	dir := config.NormalizeSaveDir(cfg.SaveDir)
+	if dir != "" {
+		return dir
+	}
+	return fallback
+}
+
+func (u *windowUI) applySaveDirText() {
+	dir := config.NormalizeSaveDir(u.saveDirEditor.Text())
+	u.appConfig.SaveDir = dir
+	if dir == "" {
+		u.saveDirEditor.SetText(defaultSaveDir())
+		u.saveConfigStatus("Save folder reset to default.")
+	} else {
+		u.saveDirEditor.SetText(dir)
+		u.saveConfigStatus("Save folder changed: " + dir)
+	}
+}
+
+func (u *windowUI) chooseSaveDir() {
+	dir, ok, err := platformwindows.PickFolder(u.configuredSaveDir())
+	if err != nil {
+		u.status = "Folder picker failed: " + err.Error()
+		u.showToastDetail("Folder picker failed", err.Error())
+		return
+	}
+	if !ok {
+		u.status = "Folder selection canceled."
+		return
+	}
+	dir = config.NormalizeSaveDir(dir)
+	u.appConfig.SaveDir = dir
+	u.saveDirEditor.SetText(dir)
+	u.saveConfigStatus("Save folder changed: " + dir)
 }
 
 func toastSavePath(path string) string {
@@ -1201,7 +1339,7 @@ func (u *windowUI) undoLastEdit() bool {
 	default:
 		return false
 	}
-	u.redoStack = append(u.redoStack, entry)
+	u.redoStack = appendBoundedUIHistory(u.redoStack, entry)
 	return true
 }
 
@@ -1222,12 +1360,12 @@ func (u *windowUI) redoLastEdit() bool {
 	default:
 		return false
 	}
-	u.undoStack = append(u.undoStack, entry)
+	u.undoStack = appendBoundedUIHistory(u.undoStack, entry)
 	return true
 }
 
 func (u *windowUI) recordControllerEdit(from, to canvasViewState) {
-	u.undoStack = append(u.undoStack, uiEditHistoryEntry{Kind: uiEditHistoryController, From: from, To: to})
+	u.undoStack = appendBoundedUIHistory(u.undoStack, uiEditHistoryEntry{Kind: uiEditHistoryController, From: from, To: to})
 	u.redoStack = nil
 }
 
@@ -1235,13 +1373,22 @@ func (u *windowUI) recordCanvasViewEdit(from, to canvasViewState) {
 	if from == to {
 		return
 	}
-	u.undoStack = append(u.undoStack, uiEditHistoryEntry{Kind: uiEditHistoryCanvasView, From: from, To: to})
+	u.undoStack = appendBoundedUIHistory(u.undoStack, uiEditHistoryEntry{Kind: uiEditHistoryCanvasView, From: from, To: to})
 	u.redoStack = nil
 }
 
 func (u *windowUI) clearEditHistory() {
 	u.undoStack = nil
 	u.redoStack = nil
+}
+
+func appendBoundedUIHistory(stack []uiEditHistoryEntry, entry uiEditHistoryEntry) []uiEditHistoryEntry {
+	stack = append(stack, entry)
+	if len(stack) > workflow.MaxEditHistoryEntries {
+		copy(stack, stack[len(stack)-workflow.MaxEditHistoryEntries:])
+		stack = stack[:workflow.MaxEditHistoryEntries]
+	}
+	return stack
 }
 
 func (u *windowUI) captureCanvasView() canvasViewState {
@@ -1452,10 +1599,14 @@ func (u *windowUI) drawCropFrame(ops *op.Ops, sourceRect image.Rectangle, scale 
 	if scale <= 0 {
 		scale = 1
 	}
-	rect := sourceRect
+	rect := u.controller.VisibleCropRect()
+	if rect.Empty() {
+		rect = sourceRect
+	}
 	if u.cropDragging && !u.cropPreviewRect.Empty() {
 		rect = u.cropPreviewRect
 	}
+	drawCropDim(ops, sourceRect, rect)
 	width := float32(max(1, int(math.Round(2/scale))))
 	drawStrokeRect(ops, rectToEditorRect(rect), color.NRGBA{R: 56, G: 189, B: 248, A: 230}, width)
 
@@ -1463,6 +1614,23 @@ func (u *windowUI) drawCropFrame(ops *op.Ops, sourceRect image.Rectangle, scale 
 	for _, center := range cropHandleCenters(rect) {
 		drawHandleSquare(ops, center, handleSize)
 	}
+}
+
+func drawCropDim(ops *op.Ops, sourceRect, cropRect image.Rectangle) {
+	cropRect = cropRect.Canon().Intersect(sourceRect)
+	if cropRect.Empty() || cropRect.Eq(sourceRect) {
+		return
+	}
+	c := color.NRGBA{R: 2, G: 6, B: 23, A: 120}
+	fillRect := func(r image.Rectangle) {
+		if !r.Empty() {
+			paint.FillShape(ops, c, clip.Rect(r).Op())
+		}
+	}
+	fillRect(image.Rect(sourceRect.Min.X, sourceRect.Min.Y, sourceRect.Max.X, cropRect.Min.Y))
+	fillRect(image.Rect(sourceRect.Min.X, cropRect.Max.Y, sourceRect.Max.X, sourceRect.Max.Y))
+	fillRect(image.Rect(sourceRect.Min.X, cropRect.Min.Y, cropRect.Min.X, cropRect.Max.Y))
+	fillRect(image.Rect(cropRect.Max.X, cropRect.Min.Y, sourceRect.Max.X, cropRect.Max.Y))
 }
 
 func rectToEditorRect(r image.Rectangle) editor.Rect {
@@ -1528,6 +1696,13 @@ func (u *windowUI) handleCanvasPointer(gtx layout.Context, w *app.Window, bounds
 			continue
 		}
 		point := clampEditorPoint(editor.Point{X: int(pe.Position.X), Y: int(pe.Position.Y)}, bounds)
+		cropRect := bounds
+		if u.controller.Mode == workflow.ModeEditing {
+			cropRect = u.controller.VisibleCropRect()
+			if cropRect.Empty() {
+				cropRect = bounds
+			}
+		}
 
 		switch pe.Kind {
 		case pointer.Scroll:
@@ -1536,16 +1711,16 @@ func (u *windowUI) handleCanvasPointer(gtx layout.Context, w *app.Window, bounds
 				w.Invalidate()
 			}
 		case pointer.Move:
-			u.cropHoverHandle = u.hitCropHandle(point, bounds, viewport.Scale)
+			u.cropHoverHandle = u.hitCropHandle(point, cropRect, viewport.Scale)
 			w.Invalidate()
 		case pointer.Press:
 			if u.controller.Mode == workflow.ModeEditing {
-				handle := u.hitCropHandle(point, bounds, viewport.Scale)
+				handle := u.hitCropHandle(point, cropRect, viewport.Scale)
 				if handle != cropHandleNone {
 					u.cropDragging = true
 					u.cropDragHandle = handle
-					u.cropStartRect = bounds
-					u.cropPreviewRect = bounds
+					u.cropStartRect = cropRect
+					u.cropPreviewRect = cropRect
 					u.dragging = false
 					u.status = "Drag image border to crop."
 					w.Invalidate()
@@ -1611,7 +1786,7 @@ func (u *windowUI) beginCapture(w *app.Window) {
 		go func() {
 			snapshot, err := u.captureSnapshotExternal()
 			var windowTargets []platformwindows.WindowTarget
-			if err == nil && mode == "Window" {
+			if err == nil && (mode == "Window" || mode == "Scroll") {
 				windowTargets = platformwindows.VisibleWindowTargets(windowTitle)
 			}
 			done <- captureStartResult{mode: mode, snapshot: snapshot, windowTargets: windowTargets, err: err}
@@ -1656,7 +1831,9 @@ func (u *windowUI) handleCaptureStartResult(result captureStartResult, w *app.Wi
 		u.clearEditHistory()
 		u.restoreFromTray(w)
 		u.autoCopyPending = true
-		u.status = fmt.Sprintf("Editing monitor %dx%d capture.", u.controller.CapturedImage.Bounds().Dx(), u.controller.CapturedImage.Bounds().Dy())
+		size := u.controller.OutputSize()
+		u.status = fmt.Sprintf("Editing monitor %dx%d capture.", size.X, size.Y)
+		u.autoSaveCurrentImage()
 		return
 	case "Freeform":
 		u.status = "Freeform mode: drag around the target area."
@@ -1664,6 +1841,15 @@ func (u *windowUI) handleCaptureStartResult(result captureStartResult, w *app.Wi
 		u.status = "Window mode: hover a window and click it."
 		if len(result.windowTargets) == 0 {
 			u.status = "Window mode: no visible windows to select."
+			u.controller.DiscardSelectionCapture()
+			u.restoreFromTray(w)
+			return
+		}
+	case "Scroll":
+		u.status = "Scroll mode: hover a scrollable window and click it."
+		if len(result.windowTargets) == 0 {
+			u.status = "Scroll mode: no visible windows to select."
+			u.controller.DiscardSelectionCapture()
 			u.restoreFromTray(w)
 			return
 		}
@@ -1678,7 +1864,7 @@ func (u *windowUI) handleCaptureStartResult(result captureStartResult, w *app.Wi
 	dimAlpha := uint8(80)
 	var windowRects []image.Rectangle
 	var windowRegions []overlay.WindowRegion
-	if mode == "Window" {
+	if mode == "Window" || mode == "Scroll" {
 		dimAlpha = 130
 		windowTargets := result.windowTargets
 		u.windowTargets = windowTargets
@@ -1704,7 +1890,7 @@ func (u *windowUI) handleCaptureStartResult(result captureStartResult, w *app.Wi
 			WindowRects:   windowRects,
 			WindowRegions: windowRegions,
 		})
-		u.overlayResults <- overlayResult{selection: selection, ok: ok, err: err}
+		u.overlayResults <- overlayResult{mode: mode, selection: selection, ok: ok, err: err}
 		w.Invalidate()
 	}()
 
@@ -1716,17 +1902,23 @@ func (u *windowUI) handleOverlayResult(result overlayResult, w *app.Window) {
 	u.dragging = false
 	if result.err != nil {
 		u.status = "Overlay error: " + result.err.Error()
+		u.controller.DiscardSelectionCapture()
 		u.restoreFromTray(w)
 		return
 	}
 	if !result.ok {
 		u.status = "Selection canceled. You can start capture again anytime."
+		u.controller.DiscardSelectionCapture()
 		u.restoreFromTray(w)
 		return
 	}
 	var err error
-	if u.appConfig.CaptureMode == "Window" {
+	if result.mode == "Window" {
 		err = u.commitWindowSelection(result.selection.Rect)
+	} else if result.mode == "Scroll" {
+		u.controller.DiscardSelectionCapture()
+		u.startScrollCapture(result.selection.Rect, w)
+		return
 	} else if len(result.selection.Polygon) >= 3 {
 		err = u.controller.CommitFreeformSelection(result.selection.Rect, result.selection.Polygon)
 	} else {
@@ -1734,6 +1926,7 @@ func (u *windowUI) handleOverlayResult(result overlayResult, w *app.Window) {
 	}
 	if err != nil {
 		u.status = "Selection failed: " + err.Error()
+		u.controller.DiscardSelectionCapture()
 		u.restoreFromTray(w)
 		return
 	}
@@ -1741,7 +1934,9 @@ func (u *windowUI) handleOverlayResult(result overlayResult, w *app.Window) {
 	u.clearEditHistory()
 	u.restoreFromTray(w)
 	u.autoCopyPending = true
-	u.status = fmt.Sprintf("Editing %dx%d capture. Annotate, then Copy or Save.", u.controller.CapturedImage.Bounds().Dx(), u.controller.CapturedImage.Bounds().Dy())
+	size := u.controller.OutputSize()
+	u.status = fmt.Sprintf("Editing %dx%d capture. Annotate, then Copy or Save.", size.X, size.Y)
+	u.autoSaveCurrentImage()
 }
 
 func (u *windowUI) commitWindowSelection(imageRect image.Rectangle) error {
@@ -1753,6 +1948,57 @@ func (u *windowUI) commitWindowSelection(imageRect image.Rectangle) error {
 		}
 	}
 	return u.controller.CommitScreenCapture(screenRect)
+}
+
+func (u *windowUI) startScrollCapture(imageRect image.Rectangle, w *app.Window) {
+	screenRect := imageRect.Add(u.controller.VirtualScreen.Min)
+	target, ok := u.findWindowTarget(screenRect)
+	if !ok {
+		u.status = "Scroll target was not found."
+		u.showToastDetail("Scroll capture failed", u.status)
+		u.restoreFromTray(w)
+		return
+	}
+	u.restoreFromTray(w)
+	u.captureActive = true
+	u.status = "Scrolling capture in progress..."
+	u.showToastDetail("Scroll capture", "Capturing scrollable content...")
+	go func() {
+		img, err := platformwindows.CaptureScrollTarget(target)
+		u.scrollResults <- scrollCaptureResult{target: target, img: img, err: err}
+		w.Invalidate()
+	}()
+}
+
+func (u *windowUI) handleScrollCaptureResult(result scrollCaptureResult) {
+	u.captureActive = false
+	if result.err != nil {
+		u.status = "Scroll capture failed: " + result.err.Error()
+		u.showToastDetail("Scroll capture failed", result.err.Error())
+		return
+	}
+	if result.img == nil || result.img.Bounds().Empty() {
+		u.status = "Scroll capture failed: empty image."
+		u.showToastDetail("Scroll capture failed", "Empty image")
+		return
+	}
+	if err := u.controller.CommitExternalImage(scrollExternalRect(result.target, result.img), result.img); err != nil {
+		u.status = "Scroll capture failed: " + err.Error()
+		u.showToastDetail("Scroll capture failed", err.Error())
+		return
+	}
+	u.resetCanvasView()
+	u.clearEditHistory()
+	u.autoCopyPending = true
+	size := u.controller.OutputSize()
+	u.status = fmt.Sprintf("Editing %dx%d scroll capture. Annotate, then Copy or Save.", size.X, size.Y)
+	u.showToastDetail("Scroll capture ready", fmt.Sprintf("%dx%d image captured", size.X, size.Y))
+	u.autoSaveCurrentImage()
+}
+
+func scrollExternalRect(target platformwindows.WindowTarget, img image.Image) image.Rectangle {
+	bounds := img.Bounds()
+	return image.Rectangle{Min: target.Rect.Min, Max: target.Rect.Min.Add(bounds.Size())}
 }
 
 func (u *windowUI) findWindowTarget(screenRect image.Rectangle) (platformwindows.WindowTarget, bool) {
@@ -1783,7 +2029,9 @@ func (u *windowUI) commitGesture() {
 			return
 		}
 		u.autoCopyPending = true
-		u.status = fmt.Sprintf("Editing %dx%d capture. Annotate, then Copy or Save.", u.controller.CapturedImage.Bounds().Dx(), u.controller.CapturedImage.Bounds().Dy())
+		size := u.controller.OutputSize()
+		u.status = fmt.Sprintf("Editing %dx%d capture. Annotate, then Copy or Save.", size.X, size.Y)
+		u.autoSaveCurrentImage()
 	case workflow.ModeEditing:
 		var err error
 		switch u.activeTool {

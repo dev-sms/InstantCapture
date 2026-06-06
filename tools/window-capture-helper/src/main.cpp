@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <UIAutomationClient.h>
 #include <wincodec.h>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
@@ -28,6 +29,7 @@ auto wait_for(Async const& async, Windows::Foundation::TimeSpan const& timeout);
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <iomanip>
@@ -37,6 +39,7 @@ auto wait_for(Async const& async, Windows::Foundation::TimeSpan const& timeout);
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace WGC = winrt::Windows::Graphics::Capture;
 namespace WGD = winrt::Windows::Graphics::DirectX;
@@ -46,10 +49,14 @@ namespace WGraphics = winrt::Windows::Graphics;
 namespace {
 
 struct Options {
+    std::string command;
     HWND hwnd{};
     std::wstring outputPath;
     bool json = false;
     int timeoutMs = 2000;
+    int maxFrames = 8;
+    int delayMs = 250;
+    int overlapPx = 96;
 };
 
 struct CaptureResult {
@@ -60,6 +67,16 @@ struct CaptureResult {
     int height = 0;
     std::string errorCode;
     std::string message;
+};
+
+struct Bitmap {
+    int width = 0;
+    int height = 0;
+    std::vector<uint8_t> bgra;
+
+    bool empty() const {
+        return width <= 0 || height <= 0 || bgra.empty();
+    }
 };
 
 std::wstring widen(std::string const& value) {
@@ -133,11 +150,16 @@ HWND parseHwnd(std::string const& value) {
 }
 
 Options parseArgs(int argc, char** argv) {
-    if (argc < 2 || std::string(argv[1]) != "capture-window") {
-        throw std::runtime_error("usage: instantcapture-window-helper capture-window --hwnd 0x... --out path [--json] [--timeout-ms n]");
+    if (argc < 2) {
+        throw std::runtime_error("usage: instantcapture-window-helper <capture-window|capture-scroll> --hwnd 0x... --out path [--json]");
+    }
+    std::string command = argv[1];
+    if (command != "capture-window" && command != "capture-scroll") {
+        throw std::runtime_error("usage: instantcapture-window-helper <capture-window|capture-scroll> --hwnd 0x... --out path [--json]");
     }
 
     Options opt;
+    opt.command = command;
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         auto requireValue = [&](char const* name) -> std::string {
@@ -155,6 +177,12 @@ Options parseArgs(int argc, char** argv) {
             opt.json = true;
         } else if (arg == "--timeout-ms") {
             opt.timeoutMs = (std::max)(100, std::stoi(requireValue("--timeout-ms")));
+        } else if (arg == "--max-frames") {
+            opt.maxFrames = (std::min)(32, (std::max)(1, std::stoi(requireValue("--max-frames"))));
+        } else if (arg == "--delay-ms") {
+            opt.delayMs = (std::min)(2000, (std::max)(0, std::stoi(requireValue("--delay-ms"))));
+        } else if (arg == "--overlap-px") {
+            opt.overlapPx = (std::min)(1000, (std::max)(0, std::stoi(requireValue("--overlap-px"))));
         } else if (arg == "--method") {
             std::string method = requireValue("--method");
             if (method != "wgc" && method != "auto") {
@@ -243,7 +271,7 @@ winrt::com_ptr<ID3D11Texture2D> textureFromSurface(WGD3D::IDirect3DSurface const
     return texture;
 }
 
-void saveTextureAsPng(ID3D11Device* device, ID3D11Texture2D* source, WGraphics::SizeInt32 size, std::wstring const& path) {
+Bitmap bitmapFromTexture(ID3D11Device* device, ID3D11Texture2D* source, WGraphics::SizeInt32 size) {
     if (size.Width <= 0 || size.Height <= 0) {
         throw std::runtime_error("captured frame has empty content size");
     }
@@ -286,6 +314,24 @@ void saveTextureAsPng(ID3D11Device* device, ID3D11Texture2D* source, WGraphics::
         }
     } unmap{ context.get(), staging.get() };
 
+    Bitmap bitmap;
+    bitmap.width = size.Width;
+    bitmap.height = size.Height;
+    bitmap.bgra.resize(static_cast<size_t>(bitmap.width) * static_cast<size_t>(bitmap.height) * 4);
+    uint8_t* src = static_cast<uint8_t*>(mapped.pData);
+    for (int y = 0; y < bitmap.height; ++y) {
+        std::copy(src + static_cast<size_t>(y) * mapped.RowPitch,
+                  src + static_cast<size_t>(y) * mapped.RowPitch + static_cast<size_t>(bitmap.width) * 4,
+                  bitmap.bgra.data() + static_cast<size_t>(y) * static_cast<size_t>(bitmap.width) * 4);
+    }
+    return bitmap;
+}
+
+void saveBitmapAsPng(Bitmap const& bitmap, std::wstring const& path) {
+    if (bitmap.empty()) {
+        throw std::runtime_error("bitmap is empty");
+    }
+
     winrt::com_ptr<IWICImagingFactory> factory;
     winrt::check_hresult(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(factory.put())));
 
@@ -301,7 +347,7 @@ void saveTextureAsPng(ID3D11Device* device, ID3D11Texture2D* source, WGraphics::
     winrt::com_ptr<IPropertyBag2> properties;
     winrt::check_hresult(encoder->CreateNewFrame(frame.put(), properties.put()));
     winrt::check_hresult(frame->Initialize(properties.get()));
-    winrt::check_hresult(frame->SetSize(static_cast<UINT>(size.Width), static_cast<UINT>(size.Height)));
+    winrt::check_hresult(frame->SetSize(static_cast<UINT>(bitmap.width), static_cast<UINT>(bitmap.height)));
 
     WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
     winrt::check_hresult(frame->SetPixelFormat(&format));
@@ -310,32 +356,22 @@ void saveTextureAsPng(ID3D11Device* device, ID3D11Texture2D* source, WGraphics::
     }
 
     winrt::check_hresult(frame->WritePixels(
-        static_cast<UINT>(size.Height),
-        mapped.RowPitch,
-        mapped.RowPitch * static_cast<UINT>(size.Height),
-        static_cast<BYTE*>(mapped.pData)));
+        static_cast<UINT>(bitmap.height),
+        static_cast<UINT>(bitmap.width * 4),
+        static_cast<UINT>(bitmap.bgra.size()),
+        const_cast<BYTE*>(reinterpret_cast<BYTE const*>(bitmap.bgra.data()))));
     winrt::check_hresult(frame->Commit());
     winrt::check_hresult(encoder->Commit());
 }
 
-CaptureResult captureWindow(Options const& opt) {
-    CaptureResult result;
-    result.outputPath = opt.outputPath;
+void saveTextureAsPng(ID3D11Device* device, ID3D11Texture2D* source, WGraphics::SizeInt32 size, std::wstring const& path) {
+    saveBitmapAsPng(bitmapFromTexture(device, source, size), path);
+}
 
-    if (!WGC::GraphicsCaptureSession::IsSupported()) {
-        result.errorCode = "WGC_UNSUPPORTED";
-        result.message = "Windows Graphics Capture is not supported on this device.";
-        return result;
-    }
-
-    winrt::com_ptr<ID3D11Device> d3dDevice = createD3DDevice();
-    WGD3D::IDirect3DDevice winrtDevice = createWinRTDevice(d3dDevice.get());
-    WGC::GraphicsCaptureItem item = createCaptureItem(opt.hwnd);
+Bitmap captureWindowBitmap(ID3D11Device* d3dDevice, WGD3D::IDirect3DDevice const& winrtDevice, WGC::GraphicsCaptureItem const& item, int timeoutMs) {
     WGraphics::SizeInt32 size = item.Size();
     if (size.Width <= 0 || size.Height <= 0) {
-        result.errorCode = "WGC_EMPTY_ITEM";
-        result.message = "GraphicsCaptureItem has an empty size.";
-        return result;
+        throw std::runtime_error("GraphicsCaptureItem has an empty size");
     }
 
     WGC::Direct3D11CaptureFrame captured{ nullptr };
@@ -361,25 +397,222 @@ CaptureResult captureWindow(Options const& opt) {
     session.StartCapture();
     {
         std::unique_lock<std::mutex> lock(mutex);
-        cv.wait_for(lock, std::chrono::milliseconds(opt.timeoutMs), [&] { return arrived; });
+        cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] { return arrived; });
     }
     framePool.FrameArrived(token);
     session.Close();
     framePool.Close();
 
     if (!captured) {
-        result.errorCode = "WGC_TIMEOUT";
-        result.message = "Timed out waiting for a WGC frame.";
+        throw std::runtime_error("Timed out waiting for a WGC frame");
+    }
+
+    winrt::com_ptr<ID3D11Texture2D> texture = textureFromSurface(captured.Surface());
+    return bitmapFromTexture(d3dDevice, texture.get(), captured.ContentSize());
+}
+
+CaptureResult captureWindow(Options const& opt) {
+    CaptureResult result;
+    result.outputPath = opt.outputPath;
+
+    if (!WGC::GraphicsCaptureSession::IsSupported()) {
+        result.errorCode = "WGC_UNSUPPORTED";
+        result.message = "Windows Graphics Capture is not supported on this device.";
         return result;
     }
 
-    WGraphics::SizeInt32 contentSize = captured.ContentSize();
-    winrt::com_ptr<ID3D11Texture2D> texture = textureFromSurface(captured.Surface());
-    saveTextureAsPng(d3dDevice.get(), texture.get(), contentSize, opt.outputPath);
+    winrt::com_ptr<ID3D11Device> d3dDevice = createD3DDevice();
+    WGD3D::IDirect3DDevice winrtDevice = createWinRTDevice(d3dDevice.get());
+    WGC::GraphicsCaptureItem item = createCaptureItem(opt.hwnd);
+
+    Bitmap bitmap = captureWindowBitmap(d3dDevice.get(), winrtDevice, item, opt.timeoutMs);
+    saveBitmapAsPng(bitmap, opt.outputPath);
 
     result.ok = true;
-    result.width = contentSize.Width;
-    result.height = contentSize.Height;
+    result.width = bitmap.width;
+    result.height = bitmap.height;
+    return result;
+}
+
+winrt::com_ptr<IUIAutomationScrollPattern> scrollPatternFromElement(IUIAutomationElement* element) {
+    if (!element) {
+        return nullptr;
+    }
+    winrt::com_ptr<IUnknown> unknown;
+    HRESULT hr = element->GetCurrentPattern(UIA_ScrollPatternId, unknown.put());
+    if (FAILED(hr) || !unknown) {
+        return nullptr;
+    }
+    winrt::com_ptr<IUIAutomationScrollPattern> pattern;
+    hr = unknown->QueryInterface(IID_PPV_ARGS(pattern.put()));
+    if (FAILED(hr) || !pattern) {
+        return nullptr;
+    }
+    BOOL verticallyScrollable = FALSE;
+    if (FAILED(pattern->get_CurrentVerticallyScrollable(&verticallyScrollable)) || !verticallyScrollable) {
+        return nullptr;
+    }
+    return pattern;
+}
+
+winrt::com_ptr<IUIAutomationScrollPattern> findScrollPattern(HWND hwnd) {
+    winrt::com_ptr<IUIAutomation> automation;
+    winrt::check_hresult(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(automation.put())));
+
+    winrt::com_ptr<IUIAutomationElement> root;
+    winrt::check_hresult(automation->ElementFromHandle(hwnd, root.put()));
+    if (auto pattern = scrollPatternFromElement(root.get())) {
+        return pattern;
+    }
+
+    RECT rect{};
+    if (!GetWindowRect(hwnd, &rect)) {
+        return nullptr;
+    }
+    POINT center{ (rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2 };
+    winrt::com_ptr<IUIAutomationElement> element;
+    if (SUCCEEDED(automation->ElementFromPoint(center, element.put())) && element) {
+        winrt::com_ptr<IUIAutomationTreeWalker> walker;
+        automation->get_ControlViewWalker(walker.put());
+        for (int depth = 0; depth < 24 && element; ++depth) {
+            if (auto pattern = scrollPatternFromElement(element.get())) {
+                return pattern;
+            }
+            if (!walker) {
+                break;
+            }
+            winrt::com_ptr<IUIAutomationElement> parent;
+            if (FAILED(walker->GetParentElement(element.get(), parent.put())) || !parent) {
+                break;
+            }
+            element = parent;
+        }
+    }
+
+    return nullptr;
+}
+
+struct ScrollPositionGuard {
+    IUIAutomationScrollPattern* pattern{};
+    double percent = -1;
+    bool restored = false;
+
+    ~ScrollPositionGuard() {
+        restore();
+    }
+
+    void restore() {
+        if (!restored && pattern && percent >= 0) {
+            pattern->SetScrollPercent(-1.0, percent);
+            restored = true;
+        }
+    }
+};
+
+Bitmap stitchVertical(std::vector<Bitmap> const& frames, int overlapPx) {
+    if (frames.empty()) {
+        throw std::runtime_error("no frames captured for scrolling screenshot");
+    }
+    int width = frames.front().width;
+    int totalHeight = frames.front().height;
+    for (size_t i = 1; i < frames.size(); ++i) {
+        if (frames[i].empty()) {
+            continue;
+        }
+        width = (std::min)(width, frames[i].width);
+        int overlap = (std::min)(overlapPx, (std::max)(0, frames[i].height - 1));
+        totalHeight += (std::max)(1, frames[i].height - overlap);
+    }
+    Bitmap out;
+    out.width = width;
+    out.height = totalHeight;
+    out.bgra.assign(static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 4, 0);
+
+    int dstY = 0;
+    for (size_t i = 0; i < frames.size(); ++i) {
+        Bitmap const& frame = frames[i];
+        if (frame.empty()) {
+            continue;
+        }
+        int skipTop = i == 0 ? 0 : (std::min)(overlapPx, (std::max)(0, frame.height - 1));
+        int copyHeight = frame.height - skipTop;
+        int copyWidth = (std::min)(width, frame.width);
+        for (int y = 0; y < copyHeight; ++y) {
+            auto src = frame.bgra.data() + (static_cast<size_t>(y + skipTop) * frame.width * 4);
+            auto dst = out.bgra.data() + (static_cast<size_t>(dstY + y) * out.width * 4);
+            std::copy(src, src + static_cast<size_t>(copyWidth) * 4, dst);
+        }
+        dstY += copyHeight;
+    }
+    return out;
+}
+
+CaptureResult captureScroll(Options const& opt) {
+    CaptureResult result;
+    result.method = "wgc-uia-scroll";
+    result.outputPath = opt.outputPath;
+
+    if (!WGC::GraphicsCaptureSession::IsSupported()) {
+        result.errorCode = "WGC_UNSUPPORTED";
+        result.message = "Windows Graphics Capture is not supported on this device.";
+        return result;
+    }
+
+    auto pattern = findScrollPattern(opt.hwnd);
+    if (!pattern) {
+        result.errorCode = "UIA_SCROLL_UNSUPPORTED";
+        result.message = "No vertically scrollable UI Automation ScrollPattern was found for this window.";
+        return result;
+    }
+
+    winrt::com_ptr<ID3D11Device> d3dDevice = createD3DDevice();
+    WGD3D::IDirect3DDevice winrtDevice = createWinRTDevice(d3dDevice.get());
+    WGC::GraphicsCaptureItem item = createCaptureItem(opt.hwnd);
+
+    double initialPercent = -1;
+    pattern->get_CurrentVerticalScrollPercent(&initialPercent);
+    ScrollPositionGuard scrollRestore{ pattern.get(), initialPercent };
+    std::vector<Bitmap> frames;
+    frames.reserve(static_cast<size_t>(opt.maxFrames));
+    frames.push_back(captureWindowBitmap(d3dDevice.get(), winrtDevice, item, opt.timeoutMs));
+
+    double previousPercent = -1;
+    for (int i = 1; i < opt.maxFrames; ++i) {
+        double beforePercent = -1;
+        if (FAILED(pattern->get_CurrentVerticalScrollPercent(&beforePercent))) {
+            break;
+        }
+        if (beforePercent >= 99.9 || (previousPercent >= 0 && std::abs(beforePercent - previousPercent) < 0.01)) {
+            break;
+        }
+        previousPercent = beforePercent;
+        double viewSize = 20;
+        pattern->get_CurrentVerticalViewSize(&viewSize);
+        double step = (std::max)(5.0, (std::min)(45.0, viewSize * 0.85));
+        double targetPercent = (std::min)(100.0, beforePercent + step);
+        HRESULT scrollHr = pattern->SetScrollPercent(-1.0, targetPercent);
+        if (FAILED(scrollHr)) {
+            scrollHr = pattern->Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement);
+        }
+        if (FAILED(scrollHr)) {
+            break;
+        }
+        if (opt.delayMs > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(opt.delayMs));
+        }
+        double afterPercent = -1;
+        if (SUCCEEDED(pattern->get_CurrentVerticalScrollPercent(&afterPercent)) && std::abs(afterPercent - beforePercent) < 0.01) {
+            break;
+        }
+        frames.push_back(captureWindowBitmap(d3dDevice.get(), winrtDevice, item, opt.timeoutMs));
+    }
+
+    Bitmap stitched = stitchVertical(frames, opt.overlapPx);
+    scrollRestore.restore();
+    saveBitmapAsPng(stitched, opt.outputPath);
+    result.ok = true;
+    result.width = stitched.width;
+    result.height = stitched.height;
     return result;
 }
 
@@ -397,7 +630,11 @@ int main(int argc, char** argv) {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
         Options opt = parseArgs(argc, argv);
         result.outputPath = opt.outputPath;
-        result = captureWindow(opt);
+        if (opt.command == "capture-scroll") {
+            result = captureScroll(opt);
+        } else {
+            result = captureWindow(opt);
+        }
         if (opt.json) {
             printJson(result);
         } else if (!result.ok) {

@@ -23,7 +23,9 @@ func ForegroundWindowRect(string) (image.Rectangle, error)  { return image.Recta
 func VisibleWindowRects(string) []image.Rectangle           { return nil }
 func VisibleWindowTargets(string) []WindowTarget            { return nil }
 func CaptureWindowTarget(WindowTarget) (image.Image, error) { return nil, nil }
+func CaptureScrollTarget(WindowTarget) (image.Image, error) { return nil, nil }
 func CursorPosition() image.Point                           { return image.Point{} }
+func PickFolder(string) (string, bool, error)               { return "", false, nil }
 
 func DefaultScreenshotDir() string {
 	home, err := os.UserHomeDir()

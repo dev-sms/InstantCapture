@@ -27,6 +27,14 @@ tools/window-capture-helper/build-msvc.cmd
 build/window-capture-helper/Release/instantcapture-window-helper.exe capture-window --hwnd 0x00123456 --out C:\Temp\ic-window.png --json
 ```
 
+Scrolling capture MVP:
+
+```powershell
+build/window-capture-helper/Release/instantcapture-window-helper.exe capture-scroll --hwnd 0x00123456 --out C:\Temp\ic-scroll.png --json --max-frames 8 --delay-ms 250 --overlap-px 96
+```
+
+`capture-scroll` uses UI Automation `ScrollPattern` to move the selected window downward and WGC to capture each viewport. Frames are stitched vertically with a fixed overlap crop.
+
 PowerShell HWND example:
 
 ```powershell
@@ -46,6 +54,8 @@ Failures also print JSON when `--json` is present. Diagnostic text is reserved f
 ## Prototype limits
 
 - Only `capture-window` and WGC are implemented.
+- `capture-scroll` requires a vertically scrollable UI Automation `ScrollPattern` in the target window.
+- Scroll stitching is an MVP with fixed overlap trimming; sticky headers, virtualized lists, smooth scrolling, and animated content may need later refinement.
 - PrintWindow and visible-crop fallback are intentionally deferred.
 - Minimized, cloaked, protected, DRM, secure desktop, and elevated-permission windows may fail or return unusable frames.
 - The Go UI looks for the helper in the app directory and under `build/window-capture-helper`.

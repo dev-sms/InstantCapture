@@ -55,6 +55,31 @@ func TestNextSavePathAvoidsClobber(t *testing.T) {
 	}
 }
 
+func TestControllerSavePNGCreatesCustomDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "custom", "captures")
+	controller := NewController(&fakeCapturer{
+		displays: []image.Rectangle{image.Rect(0, 0, 40, 30)},
+		img:      image.NewRGBA(image.Rect(0, 0, 40, 30)),
+	})
+	if err := controller.BeginCapture(); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.CommitImageSelection(image.Rect(0, 0, 40, 30)); err != nil {
+		t.Fatal(err)
+	}
+
+	path, err := controller.SavePNG(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(path) != dir {
+		t.Fatalf("saved dir = %q, want %q", filepath.Dir(path), dir)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("saved file missing: %v", err)
+	}
+}
+
 func TestControllerCommitScreenSelection(t *testing.T) {
 	controller := NewController(&fakeCapturer{
 		displays: []image.Rectangle{image.Rect(-100, 0, 220, 200)},
@@ -68,6 +93,9 @@ func TestControllerCommitScreenSelection(t *testing.T) {
 	}
 	if controller.CapturedImage.Bounds() != image.Rect(0, 0, 100, 60) {
 		t.Fatalf("unexpected captured bounds: %v", controller.CapturedImage.Bounds())
+	}
+	if controller.FullScreenImage != nil {
+		t.Fatal("expected fullscreen image to be released after selection commit")
 	}
 }
 
@@ -98,6 +126,9 @@ func TestControllerCommitExternalImage(t *testing.T) {
 	if err := controller.BeginCapture(); err != nil {
 		t.Fatal(err)
 	}
+	if controller.FullScreenImage == nil {
+		t.Fatal("expected fullscreen image before external commit")
+	}
 	external := image.NewRGBA(image.Rect(0, 0, 40, 30))
 	if err := controller.CommitExternalImage(image.Rect(10, 20, 50, 50), external); err != nil {
 		t.Fatal(err)
@@ -108,9 +139,71 @@ func TestControllerCommitExternalImage(t *testing.T) {
 	if controller.SelectedScreen != image.Rect(10, 20, 50, 50) {
 		t.Fatalf("unexpected selected screen: %v", controller.SelectedScreen)
 	}
+	if controller.FullScreenImage != nil {
+		t.Fatal("expected fullscreen image to be released after external commit")
+	}
 }
 
-func TestControllerCropCapturedImageShiftsAnnotations(t *testing.T) {
+func TestControllerDiscardSelectionCaptureReleasesImageAndIdles(t *testing.T) {
+	controller := NewController(&fakeCapturer{
+		displays: []image.Rectangle{image.Rect(0, 0, 100, 100)},
+		img:      image.NewRGBA(image.Rect(0, 0, 100, 100)),
+	})
+	if err := controller.BeginCapture(); err != nil {
+		t.Fatal(err)
+	}
+	if controller.Mode != ModeSelecting || controller.FullScreenImage == nil {
+		t.Fatalf("unexpected pre-discard state: mode=%s image=%v", controller.Mode, controller.FullScreenImage)
+	}
+
+	controller.DiscardSelectionCapture()
+
+	if controller.Mode != ModeIdle {
+		t.Fatalf("mode = %s, want %s", controller.Mode, ModeIdle)
+	}
+	if controller.FullScreenImage != nil {
+		t.Fatal("expected fullscreen image to be released")
+	}
+}
+
+func TestControllerCapsEditHistory(t *testing.T) {
+	controller := NewController(&fakeCapturer{
+		displays: []image.Rectangle{image.Rect(0, 0, 100, 100)},
+		img:      image.NewRGBA(image.Rect(0, 0, 100, 100)),
+	})
+	if err := controller.BeginCapture(); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.CommitImageSelection(image.Rect(0, 0, 100, 100)); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < MaxEditHistoryEntries+5; i++ {
+		rect := editor.NewRect(editor.Point{X: i, Y: i}, editor.Point{X: i + 10, Y: i + 10})
+		if err := controller.AddAnnotation(editor.ToolRectangle, nil, rect); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if len(controller.undoStack) != MaxEditHistoryEntries {
+		t.Fatalf("undo history length = %d, want %d", len(controller.undoStack), MaxEditHistoryEntries)
+	}
+	undos := 0
+	for controller.UndoEdit() {
+		undos++
+	}
+	if undos != MaxEditHistoryEntries {
+		t.Fatalf("undo count = %d, want %d", undos, MaxEditHistoryEntries)
+	}
+	if len(controller.redoStack) != MaxEditHistoryEntries {
+		t.Fatalf("redo history length = %d, want %d", len(controller.redoStack), MaxEditHistoryEntries)
+	}
+	if got := len(controller.Editor.Annotations); got != 5 {
+		t.Fatalf("remaining annotations = %d, want 5", got)
+	}
+}
+
+func TestControllerCropCapturedImageKeepsSourceAndOffsetsOutput(t *testing.T) {
 	controller := NewController(&fakeCapturer{
 		displays: []image.Rectangle{image.Rect(0, 0, 200, 120)},
 		img:      image.NewRGBA(image.Rect(0, 0, 200, 120)),
@@ -129,8 +222,11 @@ func TestControllerCropCapturedImageShiftsAnnotations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := controller.CapturedImage.Bounds(); got != image.Rect(0, 0, 80, 50) {
-		t.Fatalf("unexpected cropped bounds: %v", got)
+	if got := controller.CapturedImage.Bounds(); got != image.Rect(0, 0, 120, 80) {
+		t.Fatalf("source image bounds changed: %v", got)
+	}
+	if got := controller.VisibleCropRect(); got != image.Rect(10, 5, 90, 55) {
+		t.Fatalf("unexpected crop rect: %v", got)
 	}
 	if got := controller.SelectedImageRect; got != image.Rect(30, 15, 110, 65) {
 		t.Fatalf("unexpected selected image rect: %v", got)
@@ -139,9 +235,16 @@ func TestControllerCropCapturedImageShiftsAnnotations(t *testing.T) {
 		t.Fatalf("unexpected selected screen rect: %v", got)
 	}
 	commands := controller.Editor.RenderCommands()
-	wantRect := editor.NewRect(editor.Point{X: 20, Y: 15}, editor.Point{X: 70, Y: 55})
+	wantRect := editor.NewRect(editor.Point{X: 30, Y: 20}, editor.Point{X: 80, Y: 60})
 	if commands[0].Rect != wantRect {
-		t.Fatalf("annotation was not shifted: got %#v want %#v", commands[0].Rect, wantRect)
+		t.Fatalf("annotation was shifted: got %#v want %#v", commands[0].Rect, wantRect)
+	}
+	rendered, err := controller.RenderedImage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rendered.Bounds(); got != image.Rect(0, 0, 80, 50) {
+		t.Fatalf("unexpected rendered crop bounds: %v", got)
 	}
 }
 
@@ -179,14 +282,20 @@ func TestControllerUndoRedoAnnotationAndCrop(t *testing.T) {
 	if err := controller.CropCapturedImage(image.Rect(10, 5, 90, 55)); err != nil {
 		t.Fatal(err)
 	}
-	if got := controller.CapturedImage.Bounds(); got != image.Rect(0, 0, 80, 50) {
-		t.Fatalf("unexpected cropped bounds: %v", got)
+	if got := controller.CapturedImage.Bounds(); got != image.Rect(0, 0, 120, 80) {
+		t.Fatalf("source image bounds changed: %v", got)
+	}
+	if got := controller.VisibleCropRect(); got != image.Rect(10, 5, 90, 55) {
+		t.Fatalf("unexpected crop rect: %v", got)
 	}
 	if !controller.UndoEdit() {
 		t.Fatal("expected crop undo")
 	}
 	if got := controller.CapturedImage.Bounds(); got != image.Rect(0, 0, 120, 80) {
 		t.Fatalf("unexpected undo bounds: %v", got)
+	}
+	if got := controller.VisibleCropRect(); got != image.Rect(0, 0, 120, 80) {
+		t.Fatalf("unexpected undo crop rect: %v", got)
 	}
 	if got := controller.SelectedScreen; got != image.Rect(20, 10, 140, 90) {
 		t.Fatalf("unexpected undo selected screen: %v", got)
@@ -197,13 +306,16 @@ func TestControllerUndoRedoAnnotationAndCrop(t *testing.T) {
 	if !controller.RedoEdit() {
 		t.Fatal("expected crop redo")
 	}
-	if got := controller.CapturedImage.Bounds(); got != image.Rect(0, 0, 80, 50) {
-		t.Fatalf("unexpected redo bounds: %v", got)
+	if got := controller.CapturedImage.Bounds(); got != image.Rect(0, 0, 120, 80) {
+		t.Fatalf("source image bounds changed after redo: %v", got)
+	}
+	if got := controller.VisibleCropRect(); got != image.Rect(10, 5, 90, 55) {
+		t.Fatalf("unexpected redo crop rect: %v", got)
 	}
 	if got := controller.SelectedScreen; got != image.Rect(30, 15, 110, 65) {
 		t.Fatalf("unexpected redo selected screen: %v", got)
 	}
-	if got := controller.Editor.Annotations[0].Rect; got != editor.NewRect(editor.Point{X: 20, Y: 15}, editor.Point{X: 70, Y: 55}) {
+	if got := controller.Editor.Annotations[0].Rect; got != editor.NewRect(editor.Point{X: 30, Y: 20}, editor.Point{X: 80, Y: 60}) {
 		t.Fatalf("unexpected redo annotation rect: %#v", got)
 	}
 }

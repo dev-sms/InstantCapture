@@ -23,7 +23,10 @@ target_link_libraries(instantcapture-window-helper PRIVATE
     d3d11
     dxgi
     user32
+    ole32
+    oleaut32
     runtimeobject
+    uiautomationcore
     windowsapp
     windowscodecs
 )

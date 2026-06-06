@@ -27,7 +27,7 @@ MVP goals:
 5. Draw with `Pen`, `Rect`, or `Arrow` in the editor window.
 6. Click `Copy PNG` / `Save PNG`, or press `Ctrl+C` / `Ctrl+S`.
 
-Saved files are written to the user's `Pictures\Screenshots` folder as `InstantCapture_YYYYMMDD_HHMMSS.png`.
+Saved files are written to the configured save folder as `InstantCapture_YYYYMMDD_HHMMSS.png`. By default this is the user's `Pictures\Screenshots` folder.
 
 On Windows, InstantCapture first tries a native Win32 topmost layered overlay window. If native overlay initialization fails, it falls back to the Gio borderless fullscreen overlay.
 
@@ -37,6 +37,7 @@ On Windows, InstantCapture first tries a native Win32 topmost layered overlay wi
 - Click the hotkey button to cycle supported capture hotkey presets.
 - Click `Mode` in the title toolbar to switch Region/Window/Freeform/Fullscreen capture.
 - Toggle `Minimize to tray` and `Focus-loss tray` from the settings strip.
+- Toggle `Auto save` and set a custom save folder by typing a path or using `Browse...`.
 - Use the border palette/RGB field and width slider to customize annotation style.
 - Settings are saved as `config.json` next to `InstantCapture.exe`.
 

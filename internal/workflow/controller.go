@@ -21,6 +21,8 @@ const (
 	ModeEditing   Mode = "editing"
 )
 
+const MaxEditHistoryEntries = 20
+
 type CaptureSnapshot struct {
 	VirtualScreen image.Rectangle
 	Displays      []image.Rectangle
@@ -37,6 +39,8 @@ type Controller struct {
 	VirtualScreen     image.Rectangle
 	FullScreenImage   image.Image
 	CapturedImage     image.Image
+	CapturedImageRect image.Rectangle
+	CropRect          image.Rectangle
 	SelectedImageRect image.Rectangle
 	SelectedScreen    image.Rectangle
 
@@ -46,7 +50,9 @@ type Controller struct {
 }
 
 type editSnapshot struct {
-	CapturedImage     *image.RGBA
+	CapturedImage     image.Image
+	CapturedImageRect image.Rectangle
+	CropRect          image.Rectangle
 	SelectedImageRect image.Rectangle
 	SelectedScreen    image.Rectangle
 	Editor            *editor.Editor
@@ -117,6 +123,8 @@ func (c *Controller) BeginCaptureFromSnapshot(snapshot CaptureSnapshot) error {
 	c.VirtualScreen = snapshot.VirtualScreen
 	c.FullScreenImage = normalizeImage(snapshot.Image)
 	c.CapturedImage = nil
+	c.CapturedImageRect = image.Rectangle{}
+	c.CropRect = image.Rectangle{}
 	c.SelectedImageRect = image.Rectangle{}
 	c.SelectedScreen = image.Rectangle{}
 	c.Editor = editor.NewEditor()
@@ -139,11 +147,13 @@ func (c *Controller) CommitImageSelection(selection image.Rectangle) error {
 	}
 
 	c.CapturedImage = cropImage(c.FullScreenImage, selection)
-	c.SelectedImageRect = selection
-	c.SelectedScreen = selection.Add(c.VirtualScreen.Min)
+	c.ReleaseFullScreenImage()
+	c.CapturedImageRect = image.Rectangle{Min: selection.Min, Max: selection.Min.Add(c.CapturedImage.Bounds().Size())}
+	c.CropRect = image.Rectangle{Max: c.CapturedImage.Bounds().Size()}
+	c.updateSelectedRectsFromCrop()
 	c.Editor = editor.NewEditor()
-	c.Editor.BeginSelection(editor.Point{X: selection.Min.X, Y: selection.Min.Y})
-	if err := c.Editor.UpdateSelection(editor.Point{X: selection.Max.X, Y: selection.Max.Y}); err != nil {
+	c.Editor.BeginSelection(editor.Point{})
+	if err := c.Editor.UpdateSelection(editor.Point{X: c.CropRect.Dx(), Y: c.CropRect.Dy()}); err != nil {
 		return err
 	}
 	if _, err := c.Editor.CommitSelection(); err != nil {
@@ -231,8 +241,12 @@ func (c *Controller) CommitExternalImage(screenRect image.Rectangle, img image.I
 		return fmt.Errorf("external image is nil")
 	}
 	c.CapturedImage = normalizeImage(img)
-	c.SelectedScreen = screenRect
-	c.SelectedImageRect = screenRect.Sub(c.VirtualScreen.Min)
+	c.ReleaseFullScreenImage()
+	screenMin := screenRect.Min
+	imageMin := screenMin.Sub(c.VirtualScreen.Min)
+	c.CapturedImageRect = image.Rectangle{Min: imageMin, Max: imageMin.Add(c.CapturedImage.Bounds().Size())}
+	c.CropRect = image.Rectangle{Max: c.CapturedImage.Bounds().Size()}
+	c.updateSelectedRectsFromCrop()
 	c.Editor = editor.NewEditor()
 	c.Editor.BeginSelection(editor.Point{X: 0, Y: 0})
 	if err := c.Editor.UpdateSelection(editor.Point{X: c.CapturedImage.Bounds().Dx(), Y: c.CapturedImage.Bounds().Dy()}); err != nil {
@@ -293,7 +307,7 @@ func (c *Controller) UndoEdit() bool {
 	current := c.snapshotEditState()
 	last := c.undoStack[len(c.undoStack)-1]
 	c.undoStack = c.undoStack[:len(c.undoStack)-1]
-	c.redoStack = append(c.redoStack, current)
+	c.redoStack = appendBoundedEditHistory(c.redoStack, current)
 	c.restoreEditState(last)
 	return true
 }
@@ -305,7 +319,7 @@ func (c *Controller) RedoEdit() bool {
 	current := c.snapshotEditState()
 	next := c.redoStack[len(c.redoStack)-1]
 	c.redoStack = c.redoStack[:len(c.redoStack)-1]
-	c.undoStack = append(c.undoStack, current)
+	c.undoStack = appendBoundedEditHistory(c.undoStack, current)
 	c.restoreEditState(next)
 	return true
 }
@@ -324,6 +338,13 @@ func (c *Controller) RenderedImage() (*image.RGBA, error) {
 	if c.CapturedImage == nil {
 		return nil, fmt.Errorf("captured image is nil")
 	}
+	return exporter.RenderAnnotationsCropped(c.CapturedImage, c.Editor.RenderCommands(), c.VisibleCropRect())
+}
+
+func (c *Controller) PreviewImage() (*image.RGBA, error) {
+	if c.CapturedImage == nil {
+		return nil, fmt.Errorf("captured image is nil")
+	}
 	return exporter.RenderAnnotations(c.CapturedImage, c.Editor.RenderCommands())
 }
 
@@ -335,28 +356,26 @@ func (c *Controller) CropCapturedImage(rect image.Rectangle) error {
 		return fmt.Errorf("captured image is nil")
 	}
 
-	bounds := image.Rectangle{Max: c.CapturedImage.Bounds().Size()}
+	bounds := c.CapturedImageBounds()
 	rect = rect.Canon().Intersect(bounds)
 	if rect.Empty() {
 		return fmt.Errorf("crop rectangle is empty")
 	}
-	if rect.Eq(bounds) {
+	if rect.Eq(c.VisibleCropRect()) {
 		return nil
 	}
 
 	c.pushEditHistory()
-	c.CapturedImage = cropImage(c.CapturedImage, rect)
-	c.SelectedImageRect = image.Rectangle{Min: c.SelectedImageRect.Min.Add(rect.Min), Max: c.SelectedImageRect.Min.Add(rect.Max)}
-	c.SelectedScreen = image.Rectangle{Min: c.SelectedScreen.Min.Add(rect.Min), Max: c.SelectedScreen.Min.Add(rect.Max)}
+	c.CropRect = rect
+	c.updateSelectedRectsFromCrop()
 	if c.Editor != nil {
-		c.Editor.Selection = editor.Rect{Min: editor.Point{}, Max: editor.Point{X: rect.Dx(), Y: rect.Dy()}}
-		c.Editor.TranslateAnnotations(editor.Point{X: -rect.Min.X, Y: -rect.Min.Y})
+		c.Editor.Selection = rectToEditorRect(rect)
 	}
 	return nil
 }
 
 func (c *Controller) pushEditHistory() {
-	c.undoStack = append(c.undoStack, c.snapshotEditState())
+	c.undoStack = appendBoundedEditHistory(c.undoStack, c.snapshotEditState())
 	c.redoStack = nil
 }
 
@@ -367,7 +386,9 @@ func (c *Controller) clearEditHistory() {
 
 func (c *Controller) snapshotEditState() editSnapshot {
 	return editSnapshot{
-		CapturedImage:     cloneRGBA(c.CapturedImage),
+		CapturedImage:     c.CapturedImage,
+		CapturedImageRect: c.CapturedImageRect,
+		CropRect:          c.CropRect,
 		SelectedImageRect: c.SelectedImageRect,
 		SelectedScreen:    c.SelectedScreen,
 		Editor:            cloneEditor(c.Editor),
@@ -375,8 +396,30 @@ func (c *Controller) snapshotEditState() editSnapshot {
 	}
 }
 
+func appendBoundedEditHistory(stack []editSnapshot, item editSnapshot) []editSnapshot {
+	stack = append(stack, item)
+	if len(stack) > MaxEditHistoryEntries {
+		copy(stack, stack[len(stack)-MaxEditHistoryEntries:])
+		stack = stack[:MaxEditHistoryEntries]
+	}
+	return stack
+}
+
+func (c *Controller) ReleaseFullScreenImage() {
+	c.FullScreenImage = nil
+}
+
+func (c *Controller) DiscardSelectionCapture() {
+	c.ReleaseFullScreenImage()
+	if c.Mode == ModeSelecting {
+		c.Mode = ModeIdle
+	}
+}
+
 func (c *Controller) restoreEditState(snapshot editSnapshot) {
-	c.CapturedImage = cloneRGBA(snapshot.CapturedImage)
+	c.CapturedImage = snapshot.CapturedImage
+	c.CapturedImageRect = snapshot.CapturedImageRect
+	c.CropRect = snapshot.CropRect
 	c.SelectedImageRect = snapshot.SelectedImageRect
 	c.SelectedScreen = snapshot.SelectedScreen
 	c.Editor = cloneEditor(snapshot.Editor)
@@ -412,6 +455,45 @@ func cloneRGBA(src image.Image) *image.RGBA {
 	return cropImage(src, src.Bounds())
 }
 
+func (c *Controller) CapturedImageBounds() image.Rectangle {
+	if c.CapturedImage == nil {
+		return image.Rectangle{}
+	}
+	return image.Rectangle{Max: c.CapturedImage.Bounds().Size()}
+}
+
+func (c *Controller) VisibleCropRect() image.Rectangle {
+	bounds := c.CapturedImageBounds()
+	if bounds.Empty() {
+		return image.Rectangle{}
+	}
+	rect := c.CropRect.Canon().Intersect(bounds)
+	if rect.Empty() {
+		return bounds
+	}
+	return rect
+}
+
+func (c *Controller) OutputSize() image.Point {
+	return c.VisibleCropRect().Size()
+}
+
+func (c *Controller) updateSelectedRectsFromCrop() {
+	crop := c.VisibleCropRect()
+	if crop.Empty() {
+		c.SelectedImageRect = image.Rectangle{}
+		c.SelectedScreen = image.Rectangle{}
+		return
+	}
+	min := c.CapturedImageRect.Min.Add(crop.Min)
+	c.SelectedImageRect = image.Rectangle{Min: min, Max: min.Add(crop.Size())}
+	c.SelectedScreen = c.SelectedImageRect.Add(c.VirtualScreen.Min)
+}
+
+func rectToEditorRect(r image.Rectangle) editor.Rect {
+	return editor.Rect{Min: editor.Point{X: r.Min.X, Y: r.Min.Y}, Max: editor.Point{X: r.Max.X, Y: r.Max.Y}}
+}
+
 func (c *Controller) CopyPNG() error {
 	img, err := c.RenderedImage()
 	if err != nil {
@@ -427,6 +509,9 @@ func (c *Controller) SavePNG(dir string) (string, error) {
 	}
 	if dir == "" {
 		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create save dir: %w", err)
 	}
 	path := nextSavePath(dir, time.Now())
 	return path, exporter.SavePNG(path, img)

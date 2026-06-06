@@ -390,7 +390,7 @@ func nativeWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		}
 	case wmLButtonDown:
 		if s != nil {
-			if s.mode == "Window" {
+			if s.mode == "Window" || s.mode == "Scroll" {
 				if s.hover >= 0 && s.hover < len(s.windows) {
 					s.finish(Selection{Rect: s.windows[s.hover].rect}, true, nil)
 					procDestroyWindow.Call(hwnd)
@@ -411,7 +411,7 @@ func nativeWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		if s != nil {
 			s.cursor = s.clientToImage(lParamPoint(lParam))
 			s.hasCursor = true
-			if s.mode == "Window" {
+			if s.mode == "Window" || s.mode == "Scroll" {
 				s.hover = s.windowAt(s.cursor)
 			}
 			if s.selecting {
@@ -521,7 +521,7 @@ func (s *nativeSession) paint(hwnd uintptr) {
 }
 
 func (s *nativeSession) paintBuffer() []byte {
-	if s.mode != "Window" || s.hover < 0 || s.hover >= len(s.windows) || len(s.original) != len(s.bgra) || len(s.highlight) != len(s.bgra) {
+	if (s.mode != "Window" && s.mode != "Scroll") || s.hover < 0 || s.hover >= len(s.windows) || len(s.original) != len(s.bgra) || len(s.highlight) != len(s.bgra) {
 		return s.bgra
 	}
 	copy(s.highlight, s.bgra)

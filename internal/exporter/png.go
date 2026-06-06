@@ -16,15 +16,24 @@ import (
 )
 
 func RenderAnnotations(base image.Image, commands []editor.RenderCommand) (*image.RGBA, error) {
+	return RenderAnnotationsCropped(base, commands, baseBounds(base))
+}
+
+func RenderAnnotationsCropped(base image.Image, commands []editor.RenderCommand, crop image.Rectangle) (*image.RGBA, error) {
 	if base == nil {
 		return nil, fmt.Errorf("base image is nil")
 	}
 
 	bounds := base.Bounds()
-	canvas := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
-	draw.Draw(canvas, canvas.Bounds(), base, bounds.Min, draw.Src)
+	crop = crop.Canon().Intersect(bounds)
+	if crop.Empty() {
+		return nil, fmt.Errorf("crop rectangle is empty")
+	}
+	canvas := image.NewRGBA(image.Rect(0, 0, crop.Dx(), crop.Dy()))
+	draw.Draw(canvas, canvas.Bounds(), base, crop.Min, draw.Src)
 
 	ctx := gg.NewContextForRGBA(canvas)
+	ctx.Translate(float64(-crop.Min.X), float64(-crop.Min.Y))
 	for _, command := range commands {
 		passes := 1
 		if command.Tool != editor.ToolHighlight && command.Style.ColorRGBA[3] >= 255 {
@@ -39,6 +48,13 @@ func RenderAnnotations(base image.Image, commands []editor.RenderCommand) (*imag
 	}
 
 	return canvas, nil
+}
+
+func baseBounds(base image.Image) image.Rectangle {
+	if base == nil {
+		return image.Rectangle{}
+	}
+	return base.Bounds()
 }
 
 func drawCommand(ctx *gg.Context, command editor.RenderCommand) error {

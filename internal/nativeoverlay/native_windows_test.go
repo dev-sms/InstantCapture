@@ -32,6 +32,22 @@ func TestWindowAtUsesVisibleFragmentsInZOrder(t *testing.T) {
 	}
 }
 
+func TestScrollModeUsesWindowHighlightBuffer(t *testing.T) {
+	s := &nativeSession{
+		imgBounds: image.Rect(0, 0, 2, 1),
+		mode:      "Scroll",
+		hover:     0,
+		windows:   []nativeWindow{{rect: image.Rect(0, 0, 2, 1), visibleRects: []image.Rectangle{image.Rect(0, 0, 1, 1)}}},
+		bgra:      []byte{10, 10, 10, 255, 10, 10, 10, 255},
+		original:  []byte{200, 200, 200, 255, 200, 200, 200, 255},
+		highlight: make([]byte, 8),
+	}
+	got := s.paintBuffer()
+	if got[0] != 200 || got[4] != 10 {
+		t.Fatalf("Scroll highlight buffer not applied correctly: %#v", got)
+	}
+}
+
 func TestPaintBufferHighlightsVisibleFragments(t *testing.T) {
 	s := &nativeSession{
 		imgBounds: image.Rect(0, 0, 4, 2),

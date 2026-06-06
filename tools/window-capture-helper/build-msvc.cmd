@@ -24,7 +24,7 @@ cl /nologo /std:c++20 /await /EHsc /permissive- /W4 ^
   /Fo:"%OUT%\\" ^
   /Fe:"%OUT%\instantcapture-window-helper.exe" ^
   "%ROOT%\tools\window-capture-helper\src\main.cpp" ^
-  d3d11.lib dxgi.lib user32.lib runtimeobject.lib windowsapp.lib windowscodecs.lib ^
+  d3d11.lib dxgi.lib user32.lib ole32.lib oleaut32.lib runtimeobject.lib uiautomationcore.lib windowsapp.lib windowscodecs.lib ^
   /link /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup
 
 exit /b %ERRORLEVEL%

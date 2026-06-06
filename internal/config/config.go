@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type Config struct {
@@ -13,6 +14,8 @@ type Config struct {
 	HideOnFocusLoss     bool   `json:"hide_on_focus_loss"`
 	HideOnMinimize      bool   `json:"hide_on_minimize"`
 	CaptureMode         string `json:"capture_mode"`
+	AutoSave            bool   `json:"auto_save"`
+	SaveDir             string `json:"save_dir"`
 	StrokeColor         string `json:"stroke_color"`
 	StrokeWidth         int    `json:"stroke_width"`
 	HighlighterWidth    int    `json:"highlighter_width"`
@@ -21,7 +24,7 @@ type Config struct {
 }
 
 func Default() Config {
-	return Config{Hotkey: "Ctrl+Shift+C", HideOnFocusLoss: false, HideOnMinimize: true, CaptureMode: "Region", StrokeColor: "Red", StrokeWidth: 3, HighlighterWidth: 14, HighlighterAlpha: 180, TraySettingsVersion: 1}
+	return Config{Hotkey: "Ctrl+Shift+C", HideOnFocusLoss: false, HideOnMinimize: true, CaptureMode: "Region", AutoSave: false, SaveDir: "", StrokeColor: "Red", StrokeWidth: 3, HighlighterWidth: 14, HighlighterAlpha: 180, TraySettingsVersion: 1}
 }
 
 func Load() (Config, error) {
@@ -53,6 +56,7 @@ func Load() (Config, error) {
 	if cfg.CaptureMode == "" {
 		cfg.CaptureMode = Default().CaptureMode
 	}
+	cfg.SaveDir = NormalizeSaveDir(cfg.SaveDir)
 	if cfg.StrokeWidth <= 0 {
 		cfg.StrokeWidth = Default().StrokeWidth
 	}
@@ -73,11 +77,21 @@ func Save(cfg Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
 	}
+	cfg.SaveDir = NormalizeSaveDir(cfg.SaveDir)
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)
 	}
 	return os.WriteFile(path, data, 0o644)
+}
+
+func NormalizeSaveDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	dir = strings.Trim(dir, "\"")
+	if dir == "" {
+		return ""
+	}
+	return filepath.Clean(dir)
 }
 
 func Path() (string, error) {

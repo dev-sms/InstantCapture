@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -62,6 +63,12 @@ var (
 
 	windowDwmapi                = syscall.NewLazyDLL("dwmapi.dll")
 	windowDwmGetWindowAttribute = windowDwmapi.NewProc("DwmGetWindowAttribute")
+
+	windowHelperCache struct {
+		once sync.Once
+		path string
+		err  error
+	}
 )
 
 func HideWindowByTitle(title string) error {
@@ -289,6 +296,23 @@ func maxInt(a, b int) int {
 }
 
 func CaptureWindowTarget(target WindowTarget) (image.Image, error) {
+	return captureTargetWithHelper(target, "capture-window", 5*time.Second,
+		"--method", "wgc",
+		"--timeout-ms", "2500",
+	)
+}
+
+func CaptureScrollTarget(target WindowTarget) (image.Image, error) {
+	return captureTargetWithHelper(target, "capture-scroll", 10*time.Second,
+		"--method", "wgc",
+		"--timeout-ms", "2500",
+		"--max-frames", "8",
+		"--delay-ms", "250",
+		"--overlap-px", "96",
+	)
+}
+
+func captureTargetWithHelper(target WindowTarget, command string, timeout time.Duration, extraArgs ...string) (image.Image, error) {
 	helper, err := findWindowCaptureHelper()
 	if err != nil {
 		return nil, err
@@ -304,22 +328,22 @@ func CaptureWindowTarget(target WindowTarget) (image.Image, error) {
 	}
 	defer os.Remove(outPath)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, helper,
-		"capture-window",
+	args := []string{
+		command,
 		"--hwnd", fmt.Sprintf("0x%X", target.Handle),
 		"--out", outPath,
-		"--method", "wgc",
 		"--json",
-		"--timeout-ms", "2500",
-	)
+	}
+	args = append(args, extraArgs...)
+	cmd := exec.CommandContext(ctx, helper, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	stdout, err := cmd.Output()
 	if ctx.Err() == context.DeadlineExceeded {
-		return nil, fmt.Errorf("window helper timed out")
+		return nil, fmt.Errorf("window helper timed out during %s", command)
 	}
 	if err != nil {
 		if message := helperFailureMessage(stdout); message != "" {
@@ -366,6 +390,13 @@ type windowHelperResult struct {
 }
 
 func findWindowCaptureHelper() (string, error) {
+	windowHelperCache.once.Do(func() {
+		windowHelperCache.path, windowHelperCache.err = resolveWindowCaptureHelper()
+	})
+	return windowHelperCache.path, windowHelperCache.err
+}
+
+func resolveWindowCaptureHelper() (string, error) {
 	const helperName = "instantcapture-window-helper.exe"
 	if helper := os.Getenv("INSTANTCAPTURE_WINDOW_HELPER"); helper != "" {
 		info, err := os.Stat(helper)
@@ -383,13 +414,16 @@ func findWindowCaptureHelper() (string, error) {
 		)
 	}
 	if wd, err := os.Getwd(); err == nil {
-		candidates = append(candidates,
-			filepath.Join(wd, helperName),
-			filepath.Join(wd, "tools", "window-capture-helper", helperName),
-			filepath.Join(wd, "build", "window-capture-helper", helperName),
-			filepath.Join(wd, "build", "window-capture-helper", "Release", helperName),
-			filepath.Join(wd, "build", "window-capture-helper", "Debug", helperName),
-		)
+		devRoot := findDevelopmentRoot(wd)
+		if devRoot != "" {
+			candidates = append(candidates,
+				filepath.Join(devRoot, helperName),
+				filepath.Join(devRoot, "tools", "window-capture-helper", helperName),
+				filepath.Join(devRoot, "build", "window-capture-helper", helperName),
+				filepath.Join(devRoot, "build", "window-capture-helper", "Release", helperName),
+				filepath.Join(devRoot, "build", "window-capture-helper", "Debug", helperName),
+			)
+		}
 	}
 	for _, candidate := range candidates {
 		if candidate == "" {
@@ -401,6 +435,36 @@ func findWindowCaptureHelper() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("window capture helper not found")
+}
+
+func findDevelopmentRoot(start string) string {
+	for dir := filepath.Clean(start); ; dir = filepath.Dir(dir) {
+		if isDevelopmentRoot(dir) {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+	}
+}
+
+func isDevelopmentRoot(dir string) bool {
+	if info, err := os.Stat(filepath.Join(dir, "go.mod")); err != nil || info.IsDir() {
+		return false
+	}
+	if info, err := os.Stat(filepath.Join(dir, "tools", "window-capture-helper")); err != nil || !info.IsDir() {
+		return false
+	}
+	return true
+}
+
+func resetWindowCaptureHelperCacheForTest() {
+	windowHelperCache = struct {
+		once sync.Once
+		path string
+		err  error
+	}{}
 }
 
 func helperStderr(stderr string) string {

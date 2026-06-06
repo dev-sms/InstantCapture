@@ -22,4 +22,19 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.CaptureMode != "Region" {
 		t.Fatalf("unexpected capture mode: %q", cfg.CaptureMode)
 	}
+	if cfg.AutoSave {
+		t.Fatal("auto save should be off by default")
+	}
+	if cfg.SaveDir != "" {
+		t.Fatalf("unexpected default save dir: %q", cfg.SaveDir)
+	}
+}
+
+func TestNormalizeSaveDir(t *testing.T) {
+	if got := NormalizeSaveDir(` "C:\Users\me\Pictures\Screenshots" `); got != `C:\Users\me\Pictures\Screenshots` {
+		t.Fatalf("unexpected normalized dir: %q", got)
+	}
+	if got := NormalizeSaveDir("  "); got != "" {
+		t.Fatalf("blank dir should normalize to empty, got %q", got)
+	}
 }
