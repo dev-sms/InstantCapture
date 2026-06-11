@@ -34,7 +34,7 @@ On Windows, InstantCapture first tries a native Win32 topmost layered overlay wi
 ## Settings
 
 - Click `Settings` to open the settings strip.
-- Click the hotkey button to cycle supported capture hotkey presets.
+- Click the hotkey button to enter shortcut assignment mode, then press the key combination to use for capture.
 - Click `Mode` in the title toolbar to switch Region/Window/Freeform/Fullscreen capture.
 - Toggle `Minimize to tray` and `Focus-loss tray` from the settings strip.
 - Toggle `Auto save` and set a custom save folder by typing a path or using `Browse...`.

@@ -34,6 +34,7 @@ auto wait_for(Async const& async, Windows::Foundation::TimeSpan const& timeout);
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -57,6 +58,15 @@ struct Options {
     int maxFrames = 8;
     int delayMs = 250;
     int overlapPx = 96;
+    int cropX = 0;
+    int cropY = 0;
+    int cropW = 0;
+    int cropH = 0;
+    int rangeSteps = 0;
+    int rangeEndY = 0;
+    bool rangeRequested = false;
+    int wheelX = std::numeric_limits<int>::min();
+    int wheelY = std::numeric_limits<int>::min();
 };
 
 struct CaptureResult {
@@ -78,6 +88,34 @@ struct Bitmap {
         return width <= 0 || height <= 0 || bgra.empty();
     }
 };
+
+struct StitchSearchResult {
+    int skipTop = 0;
+    double score = std::numeric_limits<double>::infinity();
+    bool measured = false;
+};
+
+int medianOfRecent(std::vector<int> const& values, size_t maxCount) {
+    if (values.empty()) {
+        return -1;
+    }
+    size_t count = (std::min)(values.size(), maxCount);
+    std::vector<int> recent(values.end() - count, values.end());
+    std::sort(recent.begin(), recent.end());
+    return recent[recent.size() / 2];
+}
+
+int smoothMeasuredOverlap(int current, std::vector<int> const& measured) {
+    if (measured.size() < 2) {
+        return current;
+    }
+    size_t count = (std::min)(measured.size(), static_cast<size_t>(2));
+    std::vector<int> recent(measured.end() - count, measured.end());
+    recent.push_back(current);
+    std::sort(recent.begin(), recent.end());
+    int median = recent[recent.size() / 2];
+    return std::abs(current - median) > 3 ? median : current;
+}
 
 std::wstring widen(std::string const& value) {
     if (value.empty()) {
@@ -183,6 +221,24 @@ Options parseArgs(int argc, char** argv) {
             opt.delayMs = (std::min)(2000, (std::max)(0, std::stoi(requireValue("--delay-ms"))));
         } else if (arg == "--overlap-px") {
             opt.overlapPx = (std::min)(1000, (std::max)(0, std::stoi(requireValue("--overlap-px"))));
+        } else if (arg == "--crop-x") {
+            opt.cropX = (std::max)(0, std::stoi(requireValue("--crop-x")));
+        } else if (arg == "--crop-y") {
+            opt.cropY = (std::max)(0, std::stoi(requireValue("--crop-y")));
+        } else if (arg == "--crop-w") {
+            opt.cropW = (std::max)(0, std::stoi(requireValue("--crop-w")));
+        } else if (arg == "--crop-h") {
+            opt.cropH = (std::max)(0, std::stoi(requireValue("--crop-h")));
+        } else if (arg == "--range-steps") {
+            opt.rangeRequested = true;
+            opt.rangeSteps = (std::min)(64, (std::max)(0, std::stoi(requireValue("--range-steps"))));
+        } else if (arg == "--range-end-y") {
+            opt.rangeRequested = true;
+            opt.rangeEndY = (std::max)(0, std::stoi(requireValue("--range-end-y")));
+        } else if (arg == "--wheel-x") {
+            opt.wheelX = std::stoi(requireValue("--wheel-x"));
+        } else if (arg == "--wheel-y") {
+            opt.wheelY = std::stoi(requireValue("--wheel-y"));
         } else if (arg == "--method") {
             std::string method = requireValue("--method");
             if (method != "wgc" && method != "auto") {
@@ -465,6 +521,29 @@ winrt::com_ptr<IUIAutomationScrollPattern> findScrollPattern(HWND hwnd) {
         return pattern;
     }
 
+    VARIANT scrollAvailable;
+    VariantInit(&scrollAvailable);
+    scrollAvailable.vt = VT_BOOL;
+    scrollAvailable.boolVal = VARIANT_TRUE;
+    winrt::com_ptr<IUIAutomationCondition> scrollCondition;
+    if (SUCCEEDED(automation->CreatePropertyCondition(UIA_IsScrollPatternAvailablePropertyId, scrollAvailable, scrollCondition.put())) && scrollCondition) {
+        winrt::com_ptr<IUIAutomationElementArray> matches;
+        if (SUCCEEDED(root->FindAll(TreeScope_Subtree, scrollCondition.get(), matches.put())) && matches) {
+            int length = 0;
+            if (SUCCEEDED(matches->get_Length(&length))) {
+                for (int i = 0; i < length; ++i) {
+                    winrt::com_ptr<IUIAutomationElement> candidate;
+                    if (FAILED(matches->GetElement(i, candidate.put())) || !candidate) {
+                        continue;
+                    }
+                    if (auto pattern = scrollPatternFromElement(candidate.get())) {
+                        return pattern;
+                    }
+                }
+            }
+        }
+    }
+
     RECT rect{};
     if (!GetWindowRect(hwnd, &rect)) {
         return nullptr;
@@ -489,6 +568,26 @@ winrt::com_ptr<IUIAutomationScrollPattern> findScrollPattern(HWND hwnd) {
         }
     }
 
+    winrt::com_ptr<IUIAutomationCondition> trueCondition;
+    if (SUCCEEDED(automation->CreateTrueCondition(trueCondition.put())) && trueCondition) {
+        winrt::com_ptr<IUIAutomationElementArray> descendants;
+        if (SUCCEEDED(root->FindAll(TreeScope_Subtree, trueCondition.get(), descendants.put())) && descendants) {
+            int length = 0;
+            if (SUCCEEDED(descendants->get_Length(&length))) {
+                int limit = (std::min)(length, 800);
+                for (int i = 0; i < limit; ++i) {
+                    winrt::com_ptr<IUIAutomationElement> candidate;
+                    if (FAILED(descendants->GetElement(i, candidate.put())) || !candidate) {
+                        continue;
+                    }
+                    if (auto pattern = scrollPatternFromElement(candidate.get())) {
+                        return pattern;
+                    }
+                }
+            }
+        }
+    }
+
     return nullptr;
 }
 
@@ -509,24 +608,186 @@ struct ScrollPositionGuard {
     }
 };
 
-Bitmap stitchVertical(std::vector<Bitmap> const& frames, int overlapPx) {
+int estimateSkipTopFromScroll(int prevHeight, int nextHeight, double beforePercent, double afterPercent, double viewSize, int fallback) {
+    fallback = (std::min)(fallback, (std::max)(0, nextHeight - 1));
+    if (prevHeight <= 0 || nextHeight <= 0 || beforePercent < 0 || afterPercent < 0 || afterPercent <= beforePercent || viewSize <= 0 || viewSize >= 100) {
+        return fallback;
+    }
+    double scrollableFactor = (100.0 - viewSize) / viewSize;
+    double shiftedPixels = static_cast<double>(prevHeight) * ((afterPercent - beforePercent) / 100.0) * scrollableFactor;
+    int overlap = static_cast<int>(std::round(static_cast<double>(prevHeight) - shiftedPixels));
+    return (std::min)((std::max)(0, overlap), (std::max)(0, nextHeight - 1));
+}
+
+Bitmap stitchVertical(std::vector<Bitmap> const& frames, int overlapPx, std::vector<int> const& estimatedSkipTops = {}, std::vector<int>* frameOffsets = nullptr) {
     if (frames.empty()) {
         throw std::runtime_error("no frames captured for scrolling screenshot");
     }
+
+    auto pixelLuma = [](Bitmap const& bitmap, int x, int y) -> int {
+        auto const* pixel = bitmap.bgra.data() + (static_cast<size_t>(y) * bitmap.width + x) * 4;
+        return (29 * static_cast<int>(pixel[0]) + 150 * static_cast<int>(pixel[1]) + 77 * static_cast<int>(pixel[2])) >> 8;
+    };
+
+    auto pixelGradient = [&](Bitmap const& bitmap, int x, int y) -> int {
+        if (x <= 0 || y <= 0 || x + 1 >= bitmap.width || y + 1 >= bitmap.height) {
+            return 0;
+        }
+        int gx = std::abs(pixelLuma(bitmap, x + 1, y) - pixelLuma(bitmap, x - 1, y));
+        int gy = std::abs(pixelLuma(bitmap, x, y + 1) - pixelLuma(bitmap, x, y - 1));
+        return gx + gy;
+    };
+
+    auto bandScore = [&](Bitmap const& prev, Bitmap const& next, int prevStartY, int nextStartY, int compareHeight, int width) -> double {
+        int scrollbarMargin = (std::min)(24, (std::max)(0, width * 12 / 1000));
+        int xMin = 0;
+        int xMax = width - scrollbarMargin;
+        if (xMax <= xMin) {
+            xMin = 0;
+            xMax = width;
+        }
+        int rowStep = (std::max)(1, compareHeight / 32);
+        int colStep = (std::max)(1, (xMax - xMin) / 96);
+        double lumaA = 0;
+        double lumaB = 0;
+        double lumaAA = 0;
+        double lumaBB = 0;
+        double lumaAB = 0;
+        double gradA = 0;
+        double gradB = 0;
+        double gradAA = 0;
+        double gradBB = 0;
+        double gradAB = 0;
+        double totalDiff = 0;
+        double count = 0;
+        for (int y = 0; y < compareHeight; y += rowStep) {
+            int py = prevStartY + y;
+            int ny = nextStartY + y;
+            for (int x = xMin; x < xMax; x += colStep) {
+                double a = static_cast<double>(pixelLuma(prev, x, py));
+                double b = static_cast<double>(pixelLuma(next, x, ny));
+                lumaA += a;
+                lumaB += b;
+                lumaAA += a * a;
+                lumaBB += b * b;
+                lumaAB += a * b;
+                totalDiff += std::abs(a - b);
+
+                double ga = static_cast<double>(pixelGradient(prev, x, py));
+                double gb = static_cast<double>(pixelGradient(next, x, ny));
+                gradA += ga;
+                gradB += gb;
+                gradAA += ga * ga;
+                gradBB += gb * gb;
+                gradAB += ga * gb;
+                count += 1.0;
+            }
+        }
+        if (count < 16) {
+            return std::numeric_limits<double>::infinity();
+        }
+        double meanDiff = totalDiff / count;
+        auto nccDistance = [&](double sumA, double sumB, double sumAA, double sumBB, double sumAB) -> double {
+            double numerator = sumAB - (sumA * sumB / count);
+            double denomA = sumAA - (sumA * sumA / count);
+            double denomB = sumBB - (sumB * sumB / count);
+            double denominator = std::sqrt((std::max)(0.0, denomA) * (std::max)(0.0, denomB));
+            if (denominator <= 1e-6) {
+                return std::numeric_limits<double>::infinity();
+            }
+            double corr = numerator / denominator;
+            corr = (std::min)(1.0, (std::max)(-1.0, corr));
+            return (1.0 - corr) * 20.0;
+        };
+        double lumaScore = nccDistance(lumaA, lumaB, lumaAA, lumaBB, lumaAB);
+        double gradScore = nccDistance(gradA, gradB, gradAA, gradBB, gradAB);
+        double nccScore = (std::min)(lumaScore, gradScore);
+        if (!std::isfinite(nccScore)) {
+            if (meanDiff < 2.0) {
+                return std::numeric_limits<double>::infinity();
+            }
+            return meanDiff;
+        }
+        if (meanDiff > 30.0) {
+            return meanDiff;
+        }
+        return nccScore + meanDiff * 0.1;
+    };
+
+    auto searchBestSkip = [&](Bitmap const& prev, Bitmap const& next, int width, int compareHeight, int searchMin, int searchMax) -> StitchSearchResult {
+        StitchSearchResult result;
+        int prevStartY = prev.height - compareHeight;
+        for (int skipTop = searchMin; skipTop <= searchMax; ++skipTop) {
+            int nextStartY = skipTop - compareHeight;
+            double score = bandScore(prev, next, prevStartY, nextStartY, compareHeight, width);
+            if (score < result.score) {
+                result.score = score;
+                result.skipTop = skipTop;
+            }
+        }
+        return result;
+    };
+
+    auto detectedSkipTop = [&](Bitmap const& prev, Bitmap const& next, int width, int estimate) -> StitchSearchResult {
+        int fixedFallback = (std::min)(overlapPx, (std::max)(0, next.height - 1));
+        int fallback = estimate >= 0 ? (std::min)((std::max)(0, estimate), (std::max)(0, next.height - 1)) : fixedFallback;
+        int compareHeight = (std::min)({ 96, prev.height / 4, next.height / 4 });
+        if (compareHeight < 12 || width <= 0) {
+            return StitchSearchResult{ fallback, std::numeric_limits<double>::infinity(), false };
+        }
+        int fullMin = compareHeight;
+        int fullMax = next.height - 1;
+        if (fullMax < fullMin) {
+            return StitchSearchResult{ fallback, std::numeric_limits<double>::infinity(), false };
+        }
+
+        constexpr double acceptScore = 10.0;
+        if (estimate >= 0) {
+            int radius = (std::max)(96, next.height / 8);
+            int localMin = (std::max)(fullMin, fallback - radius);
+            int localMax = (std::min)(fullMax, fallback + radius);
+            StitchSearchResult local = searchBestSkip(prev, next, width, compareHeight, localMin, localMax);
+            if (local.score <= acceptScore) {
+                local.measured = true;
+                return local;
+            }
+        }
+
+        StitchSearchResult full = searchBestSkip(prev, next, width, compareHeight, fullMin, fullMax);
+        if (full.score <= acceptScore) {
+            full.measured = true;
+            return full;
+        }
+        return StitchSearchResult{ fallback, full.score, false };
+    };
+
     int width = frames.front().width;
+    std::vector<int> skipTops(frames.size(), 0);
+    std::vector<int> measuredOverlaps;
     int totalHeight = frames.front().height;
     for (size_t i = 1; i < frames.size(); ++i) {
         if (frames[i].empty()) {
             continue;
         }
         width = (std::min)(width, frames[i].width);
-        int overlap = (std::min)(overlapPx, (std::max)(0, frames[i].height - 1));
-        totalHeight += (std::max)(1, frames[i].height - overlap);
+        int historyEstimate = medianOfRecent(measuredOverlaps, 10);
+        int estimate = i < estimatedSkipTops.size() ? estimatedSkipTops[i] : historyEstimate;
+        StitchSearchResult detected = detectedSkipTop(frames[i - 1], frames[i], width, estimate);
+        if (detected.measured) {
+            measuredOverlaps.push_back(detected.skipTop);
+        } else if (historyEstimate >= 0) {
+            detected.skipTop = (std::min)((std::max)(historyEstimate, 1), frames[i].height - 1);
+        }
+        skipTops[i] = detected.skipTop;
+        totalHeight += (std::max)(1, frames[i].height - skipTops[i]);
     }
     Bitmap out;
     out.width = width;
     out.height = totalHeight;
     out.bgra.assign(static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 4, 0);
+    if (frameOffsets) {
+        frameOffsets->assign(frames.size(), 0);
+    }
 
     int dstY = 0;
     for (size_t i = 0; i < frames.size(); ++i) {
@@ -534,9 +795,12 @@ Bitmap stitchVertical(std::vector<Bitmap> const& frames, int overlapPx) {
         if (frame.empty()) {
             continue;
         }
-        int skipTop = i == 0 ? 0 : (std::min)(overlapPx, (std::max)(0, frame.height - 1));
+        int skipTop = i == 0 ? 0 : skipTops[i];
         int copyHeight = frame.height - skipTop;
         int copyWidth = (std::min)(width, frame.width);
+        if (frameOffsets) {
+            (*frameOffsets)[i] = dstY - skipTop;
+        }
         for (int y = 0; y < copyHeight; ++y) {
             auto src = frame.bgra.data() + (static_cast<size_t>(y + skipTop) * frame.width * 4);
             auto dst = out.bgra.data() + (static_cast<size_t>(dstY + y) * out.width * 4);
@@ -545,6 +809,178 @@ Bitmap stitchVertical(std::vector<Bitmap> const& frames, int overlapPx) {
         dstY += copyHeight;
     }
     return out;
+}
+
+Bitmap cropBitmap(Bitmap const& src, int x, int y, int width, int height) {
+    if (src.empty() || width <= 0 || height <= 0) {
+        return src;
+    }
+    x = (std::min)((std::max)(0, x), src.width);
+    y = (std::min)((std::max)(0, y), src.height);
+    int right = (std::min)(src.width, x + width);
+    int bottom = (std::min)(src.height, y + height);
+    if (right <= x || bottom <= y) {
+        return src;
+    }
+
+    Bitmap out;
+    out.width = right - x;
+    out.height = bottom - y;
+    out.bgra.resize(static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 4);
+    for (int row = 0; row < out.height; ++row) {
+        auto const* srcRow = src.bgra.data() + (static_cast<size_t>(y + row) * src.width + x) * 4;
+        auto* dstRow = out.bgra.data() + static_cast<size_t>(row) * out.width * 4;
+        std::copy(srcRow, srcRow + static_cast<size_t>(out.width) * 4, dstRow);
+    }
+    return out;
+}
+
+double bitmapDifferenceScore(Bitmap const& a, Bitmap const& b) {
+    if (a.empty() || b.empty()) {
+        return std::numeric_limits<double>::infinity();
+    }
+    int width = (std::min)(a.width, b.width);
+    int height = (std::min)(a.height, b.height);
+    int rowStep = (std::max)(1, height / 48);
+    int colStep = (std::max)(1, width / 96);
+    uint64_t total = 0;
+    uint64_t count = 0;
+    for (int y = 0; y < height; y += rowStep) {
+        for (int x = 0; x < width; x += colStep) {
+            auto const* pa = a.bgra.data() + (static_cast<size_t>(y) * a.width + x) * 4;
+            auto const* pb = b.bgra.data() + (static_cast<size_t>(y) * b.width + x) * 4;
+            total += static_cast<uint64_t>(std::abs(static_cast<int>(pa[0]) - static_cast<int>(pb[0])));
+            total += static_cast<uint64_t>(std::abs(static_cast<int>(pa[1]) - static_cast<int>(pb[1])));
+            total += static_cast<uint64_t>(std::abs(static_cast<int>(pa[2]) - static_cast<int>(pb[2])));
+            count += 3;
+        }
+    }
+    if (count == 0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return static_cast<double>(total) / static_cast<double>(count);
+}
+
+bool sendWheelInput(HWND hwnd, int delta, int wheelX = std::numeric_limits<int>::min(), int wheelY = std::numeric_limits<int>::min()) {
+    RECT rect{};
+    if (!GetWindowRect(hwnd, &rect)) {
+        return false;
+    }
+    POINT original{};
+    GetCursorPos(&original);
+    POINT center{ (rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2 };
+    if (wheelX != std::numeric_limits<int>::min() && wheelY != std::numeric_limits<int>::min()) {
+        center.x = static_cast<LONG>((std::min)((std::max)(wheelX, static_cast<int>(rect.left)), static_cast<int>(rect.right - 1)));
+        center.y = static_cast<LONG>((std::min)((std::max)(wheelY, static_cast<int>(rect.top)), static_cast<int>(rect.bottom - 1)));
+    }
+    SetForegroundWindow(hwnd);
+    SetCursorPos(center.x, center.y);
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+    input.mi.mouseData = static_cast<DWORD>(delta);
+    UINT sent = SendInput(1, &input, sizeof(INPUT));
+    std::this_thread::sleep_for(std::chrono::milliseconds(90));
+    SetCursorPos(original.x, original.y);
+    return sent == 1;
+}
+
+struct WheelScrollGuard {
+    HWND hwnd{};
+    int steps = 0;
+    int delta = 0;
+    bool restored = false;
+
+    ~WheelScrollGuard() {
+        restore();
+    }
+
+    void restore() {
+        if (restored || !hwnd || steps <= 0 || delta == 0) {
+            restored = true;
+            return;
+        }
+        for (int i = 0; i < steps; ++i) {
+            sendWheelInput(hwnd, delta);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        restored = true;
+    }
+};
+
+CaptureResult captureScrollWithWheelFallback(Options const& opt, ID3D11Device* d3dDevice, WGD3D::IDirect3DDevice const& winrtDevice, WGC::GraphicsCaptureItem const& item) {
+    CaptureResult result;
+    result.method = "wgc-wheel-scroll";
+    result.outputPath = opt.outputPath;
+
+    std::vector<Bitmap> frames;
+    frames.reserve(static_cast<size_t>(opt.maxFrames));
+    frames.push_back(captureWindowBitmap(d3dDevice, winrtDevice, item, opt.timeoutMs));
+
+    int wheelStep = opt.rangeSteps > 0 ? WHEEL_DELTA : WHEEL_DELTA * 5;
+    int targetSteps = opt.rangeSteps > 0 ? opt.rangeSteps : opt.maxFrames - 1;
+    WheelScrollGuard restore{ opt.hwnd, 0, wheelStep };
+    for (int i = 1; i <= targetSteps && i < opt.maxFrames; ++i) {
+        if (!sendWheelInput(opt.hwnd, -wheelStep, opt.wheelX, opt.wheelY)) {
+            break;
+        }
+        ++restore.steps;
+        if (opt.delayMs > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(opt.delayMs));
+        }
+        Bitmap next = captureWindowBitmap(d3dDevice, winrtDevice, item, opt.timeoutMs);
+        double score = bitmapDifferenceScore(frames.back(), next);
+        if (score < 0.5) {
+            if (!opt.rangeRequested) {
+                break;
+            }
+            bool changed = false;
+            for (int retry = 0; retry < 3; ++retry) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                next = captureWindowBitmap(d3dDevice, winrtDevice, item, opt.timeoutMs);
+                score = bitmapDifferenceScore(frames.back(), next);
+                if (score >= 0.5) {
+                    changed = true;
+                    break;
+                }
+            }
+            if (!changed) {
+                result.errorCode = "RANGE_SCROLL_INCOMPLETE";
+                result.message = "Requested scroll range did not move after wheel input.";
+                return result;
+            }
+        }
+        frames.push_back(std::move(next));
+    }
+
+    std::vector<int> frameOffsets;
+    Bitmap stitched = stitchVertical(frames, opt.overlapPx, {}, &frameOffsets);
+    restore.restore();
+    if (opt.cropW > 0 && opt.cropH > 0) {
+        int cropY = opt.cropY;
+        int cropH = opt.cropH;
+        if (opt.rangeRequested && opt.rangeSteps > 0 && opt.rangeEndY > 0) {
+            if (frameOffsets.size() <= static_cast<size_t>(opt.rangeSteps)) {
+                result.errorCode = "RANGE_SCROLL_INCOMPLETE";
+                result.message = "Requested scroll range was not fully captured.";
+                return result;
+            }
+            size_t frameIndex = (std::min)(static_cast<size_t>(opt.rangeSteps), frameOffsets.size() - 1);
+            int bottom = frameOffsets[frameIndex] + opt.rangeEndY;
+            if (bottom <= cropY) {
+                result.errorCode = "RANGE_SCROLL_INCOMPLETE";
+                result.message = "Requested scroll range measured an invalid crop.";
+                return result;
+            }
+            cropH = bottom - cropY;
+        }
+        stitched = cropBitmap(stitched, opt.cropX, cropY, opt.cropW, cropH);
+    }
+    saveBitmapAsPng(stitched, opt.outputPath);
+    result.ok = true;
+    result.width = stitched.width;
+    result.height = stitched.height;
+    return result;
 }
 
 CaptureResult captureScroll(Options const& opt) {
@@ -558,22 +994,27 @@ CaptureResult captureScroll(Options const& opt) {
         return result;
     }
 
-    auto pattern = findScrollPattern(opt.hwnd);
-    if (!pattern) {
-        result.errorCode = "UIA_SCROLL_UNSUPPORTED";
-        result.message = "No vertically scrollable UI Automation ScrollPattern was found for this window.";
-        return result;
-    }
-
     winrt::com_ptr<ID3D11Device> d3dDevice = createD3DDevice();
     WGD3D::IDirect3DDevice winrtDevice = createWinRTDevice(d3dDevice.get());
     WGC::GraphicsCaptureItem item = createCaptureItem(opt.hwnd);
+
+    if (opt.rangeRequested) {
+        return captureScrollWithWheelFallback(opt, d3dDevice.get(), winrtDevice, item);
+    }
+
+    auto pattern = findScrollPattern(opt.hwnd);
+    if (!pattern) {
+        return captureScrollWithWheelFallback(opt, d3dDevice.get(), winrtDevice, item);
+    }
 
     double initialPercent = -1;
     pattern->get_CurrentVerticalScrollPercent(&initialPercent);
     ScrollPositionGuard scrollRestore{ pattern.get(), initialPercent };
     std::vector<Bitmap> frames;
     frames.reserve(static_cast<size_t>(opt.maxFrames));
+    std::vector<int> estimatedSkipTops;
+    estimatedSkipTops.reserve(static_cast<size_t>(opt.maxFrames));
+    estimatedSkipTops.push_back(0);
     frames.push_back(captureWindowBitmap(d3dDevice.get(), winrtDevice, item, opt.timeoutMs));
 
     double previousPercent = -1;
@@ -604,10 +1045,16 @@ CaptureResult captureScroll(Options const& opt) {
         if (SUCCEEDED(pattern->get_CurrentVerticalScrollPercent(&afterPercent)) && std::abs(afterPercent - beforePercent) < 0.01) {
             break;
         }
-        frames.push_back(captureWindowBitmap(d3dDevice.get(), winrtDevice, item, opt.timeoutMs));
+        Bitmap nextFrame = captureWindowBitmap(d3dDevice.get(), winrtDevice, item, opt.timeoutMs);
+        int estimate = estimateSkipTopFromScroll(frames.back().height, nextFrame.height, beforePercent, afterPercent, viewSize, opt.overlapPx);
+        estimatedSkipTops.push_back(estimate);
+        frames.push_back(std::move(nextFrame));
     }
 
-    Bitmap stitched = stitchVertical(frames, opt.overlapPx);
+    Bitmap stitched = stitchVertical(frames, opt.overlapPx, estimatedSkipTops);
+    if (opt.cropW > 0 && opt.cropH > 0) {
+        stitched = cropBitmap(stitched, opt.cropX, opt.cropY, opt.cropW, opt.cropH);
+    }
     scrollRestore.restore();
     saveBitmapAsPng(stitched, opt.outputPath);
     result.ok = true;

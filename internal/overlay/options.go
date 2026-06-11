@@ -13,6 +13,7 @@ type Options struct {
 }
 
 type WindowRegion struct {
+	Handle       uintptr
 	Rect         image.Rectangle
 	VisibleRects []image.Rectangle
 }

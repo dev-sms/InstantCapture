@@ -11,8 +11,16 @@ import (
 var ErrUnavailable = errors.New("native overlay unavailable")
 
 type Selection struct {
-	Rect    image.Rectangle
-	Polygon []image.Point
+	Rect        image.Rectangle
+	Polygon     []image.Point
+	ScrollRange *ScrollRangeSelection
+}
+
+type ScrollRangeSelection struct {
+	WindowRect  image.Rectangle
+	CropRect    image.Rectangle
+	ViewRect    image.Rectangle
+	ScrollSteps int
 }
 
 func Select(ctx context.Context, img image.Image, options ...overlay.Options) (image.Rectangle, bool, error) {

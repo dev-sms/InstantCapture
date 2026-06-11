@@ -6,6 +6,7 @@ import (
 	"image"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -59,6 +60,22 @@ func TestCaptureFirstScrollableWindowTargetSmoke(t *testing.T) {
 	}
 	if img == nil || img.Bounds().Empty() {
 		t.Fatalf("empty captured image: %#v", img)
+	}
+}
+
+func TestCaptureScrollRangeRejectsEmptyCrop(t *testing.T) {
+	img, err := CaptureScrollRange(WindowTarget{
+		Handle: 1,
+		Rect:   image.Rect(0, 0, 100, 100),
+	}, ScrollCaptureRange{})
+	if err == nil {
+		t.Fatal("expected empty crop error")
+	}
+	if img != nil {
+		t.Fatalf("expected nil image, got %#v", img)
+	}
+	if !strings.Contains(err.Error(), "scroll range crop is empty") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,6 +27,12 @@ type WindowTarget struct {
 	Title        string
 	Rect         image.Rectangle
 	VisibleRects []image.Rectangle
+}
+
+type ScrollCaptureRange struct {
+	Crop        image.Rectangle
+	View        image.Rectangle
+	ScrollSteps int
 }
 
 type windowRect struct {
@@ -310,6 +317,83 @@ func CaptureScrollTarget(target WindowTarget) (image.Image, error) {
 		"--delay-ms", "250",
 		"--overlap-px", "96",
 	)
+}
+
+func CaptureScrollRange(target WindowTarget, r ScrollCaptureRange) (image.Image, error) {
+	crop := r.Crop.Canon()
+	if crop.Empty() {
+		return nil, fmt.Errorf("scroll range crop is empty")
+	}
+	maxFrames := scrollRangeMaxFrames(crop, target.Rect.Dy())
+	rangeSteps := cappedScrollRangeSteps(r.ScrollSteps)
+	if rangeSteps > 0 {
+		maxFrames = rangeSteps + 2
+		if maxFrames > 32 {
+			maxFrames = 32
+		}
+	}
+	wheelPoint := scrollRangeWheelPoint(target, r)
+	return captureTargetWithHelper(target, "capture-scroll", 12*time.Second,
+		"--method", "wgc",
+		"--timeout-ms", "2500",
+		"--max-frames", strconv.Itoa(maxFrames),
+		"--delay-ms", "250",
+		"--overlap-px", "96",
+		"--crop-x", strconv.Itoa(crop.Min.X),
+		"--crop-y", strconv.Itoa(crop.Min.Y),
+		"--crop-w", strconv.Itoa(crop.Dx()),
+		"--crop-h", strconv.Itoa(crop.Dy()),
+		"--range-steps", strconv.Itoa(rangeSteps),
+		"--range-end-y", strconv.Itoa(nonNegative(r.View.Max.Y)),
+		"--wheel-x", strconv.Itoa(wheelPoint.X),
+		"--wheel-y", strconv.Itoa(wheelPoint.Y),
+	)
+}
+
+func scrollRangeWheelPoint(target WindowTarget, r ScrollCaptureRange) image.Point {
+	view := r.View.Canon()
+	if view.Empty() {
+		view = r.Crop.Canon()
+	}
+	if view.Empty() {
+		return target.Rect.Min.Add(target.Rect.Size().Div(2))
+	}
+	return target.Rect.Min.Add(image.Pt(view.Min.X+view.Dx()/2, view.Min.Y+view.Dy()/2))
+}
+
+func cappedScrollRangeSteps(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 31 {
+		return 31
+	}
+	return v
+}
+
+func nonNegative(v int) int {
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+func scrollRangeMaxFrames(crop image.Rectangle, viewportHeight int) int {
+	if viewportHeight <= 0 {
+		return 8
+	}
+	needed := crop.Max.Y
+	frames := needed/viewportHeight + 3
+	if needed%viewportHeight != 0 {
+		frames++
+	}
+	if frames < 2 {
+		return 2
+	}
+	if frames > 32 {
+		return 32
+	}
+	return frames
 }
 
 func captureTargetWithHelper(target WindowTarget, command string, timeout time.Duration, extraArgs ...string) (image.Image, error) {

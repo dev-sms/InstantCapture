@@ -32,6 +32,199 @@ func TestWindowAtUsesVisibleFragmentsInZOrder(t *testing.T) {
 	}
 }
 
+func TestScrollSelectionContentAnchorSurvivesReverseScroll(t *testing.T) {
+	s := &nativeSession{
+		start:   image.Pt(20, 100),
+		current: image.Pt(80, 100),
+	}
+	s.beginScrollSelection()
+
+	s.scrollOffsetY = 720
+	s.current = image.Pt(80, 300)
+	s.updateScrollSelectionCurrent()
+
+	s.scrollOffsetY = 360
+	s.current = image.Pt(80, 220)
+	s.updateScrollSelectionCurrent()
+
+	got := s.scrollSelectionContentRect(image.Rect(0, 0, 200, 1200))
+	want := image.Rect(20, 100, 80, 1020)
+	if got != want {
+		t.Fatalf("content rect = %v, want %v", got, want)
+	}
+	if s.scrollMaxWheelSteps != 0 {
+		t.Fatalf("manual offset setup should not infer wheel steps, got %d", s.scrollMaxWheelSteps)
+	}
+}
+
+func TestScrollSelectionPreservesMaxWheelStepForReplay(t *testing.T) {
+	s := &nativeSession{
+		start:   image.Pt(20, 100),
+		current: image.Pt(80, 100),
+	}
+	s.beginScrollSelection()
+	s.scrollWheelSteps = 2
+	s.scrollOffsetY = 720
+	s.current = image.Pt(80, 300)
+	s.updateScrollSelectionCurrent()
+
+	s.scrollWheelSteps = 1
+	s.scrollOffsetY = 360
+	s.current = image.Pt(80, 220)
+	s.updateScrollSelectionCurrent()
+
+	if s.scrollMaxWheelSteps != 2 {
+		t.Fatalf("max wheel steps = %d, want 2", s.scrollMaxWheelSteps)
+	}
+	if s.scrollRangeEndViewY != 300 {
+		t.Fatalf("range end view y = %d, want 300", s.scrollRangeEndViewY)
+	}
+}
+
+func TestScrollSelectionKeepsEarlierReplayStepOnEqualContentY(t *testing.T) {
+	s := &nativeSession{
+		start:   image.Pt(20, 100),
+		current: image.Pt(80, 100),
+	}
+	s.beginScrollSelection()
+	s.scrollWheelSteps = 2
+	s.scrollOffsetY = 720
+	s.current = image.Pt(80, 300)
+	s.updateScrollSelectionCurrent()
+
+	s.scrollWheelSteps = 1
+	s.scrollOffsetY = 360
+	s.current = image.Pt(80, 660)
+	s.updateScrollSelectionCurrent()
+
+	if s.scrollMaxWheelSteps != 2 {
+		t.Fatalf("max wheel steps = %d, want 2", s.scrollMaxWheelSteps)
+	}
+	if s.scrollRangeEndViewY != 300 {
+		t.Fatalf("range end view y = %d, want 300", s.scrollRangeEndViewY)
+	}
+}
+
+func TestScrollSelectionPreviewProjectsVirtualContentPosition(t *testing.T) {
+	s := &nativeSession{
+		start:   image.Pt(20, 100),
+		current: image.Pt(80, 100),
+	}
+	s.beginScrollSelection()
+	s.scrollOffsetY = 360
+	s.current = image.Pt(80, 300)
+	s.updateScrollSelectionCurrent()
+
+	got := s.scrollSelectionPreviewRect(image.Rect(0, 0, 200, 400))
+	want := image.Rect(20, -260, 80, 300)
+	if got != want {
+		t.Fatalf("preview rect = %v, want %v", got, want)
+	}
+}
+
+func TestScrollSelectionPreviewAfterReverseScrollUsesCurrentOffset(t *testing.T) {
+	s := &nativeSession{
+		start:   image.Pt(20, 100),
+		current: image.Pt(80, 100),
+	}
+	s.beginScrollSelection()
+	s.scrollOffsetY = 720
+	s.current = image.Pt(80, 300)
+	s.updateScrollSelectionCurrent()
+	s.scrollOffsetY = 360
+	s.current = image.Pt(80, 220)
+	s.updateScrollSelectionCurrent()
+
+	got := s.scrollSelectionPreviewRect(image.Rect(0, 0, 200, 400))
+	want := image.Rect(20, -260, 80, 220)
+	if got != want {
+		t.Fatalf("preview rect after reverse = %v, want %v", got, want)
+	}
+}
+
+func TestMeasureScrollDeltaDetectsDownwardMovement(t *testing.T) {
+	before := buildScrollSample(32, 80, 0)
+	after := buildScrollSample(32, 80, 17)
+	delta, ok := measureScrollDelta(before, after, 40)
+	if !ok {
+		t.Fatal("expected measured delta")
+	}
+	if delta != 17 {
+		t.Fatalf("delta = %d, want 17", delta)
+	}
+}
+
+func TestMeasureScrollDeltaDetectsUpwardMovement(t *testing.T) {
+	before := buildScrollSample(32, 80, 17)
+	after := buildScrollSample(32, 80, 0)
+	delta, ok := measureScrollDelta(before, after, 40)
+	if !ok {
+		t.Fatal("expected measured delta")
+	}
+	if delta != -17 {
+		t.Fatalf("delta = %d, want -17", delta)
+	}
+}
+
+func TestMeasureScrollDeltaIgnoresStickyHeader(t *testing.T) {
+	before, after := buildStickyScrollSamples(40, 120, 40, 17)
+	delta, ok := measureScrollDelta(before, after, 50)
+	if !ok {
+		t.Fatal("expected measured delta with sticky header")
+	}
+	if delta != 17 {
+		t.Fatalf("delta = %d, want 17", delta)
+	}
+}
+
+func TestMeasureScrollDeltaIgnoresStickyFooter(t *testing.T) {
+	before, after := buildStickyFooterScrollSamples(40, 120, 28, 19)
+	delta, ok := measureScrollDelta(before, after, 50)
+	if !ok {
+		t.Fatal("expected measured delta with sticky footer")
+	}
+	if delta != 19 {
+		t.Fatalf("delta = %d, want 19", delta)
+	}
+}
+
+func TestMeasureScrollDeltaRejectsStaticSamples(t *testing.T) {
+	sample := buildScrollSample(32, 80, 0)
+	if delta, ok := measureScrollDelta(sample, sample, 40); ok {
+		t.Fatalf("static samples measured delta = %d", delta)
+	}
+}
+
+func buildScrollSample(width, height, offset int) scrollSample {
+	luma := make([]byte, width*height)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			absoluteY := y + offset
+			v := (absoluteY*absoluteY*17 + absoluteY*31 + x*x*11 + x*7 + (absoluteY^x)*19) % 251
+			luma[y*width+x] = byte(v)
+		}
+	}
+	return scrollSample{width: width, height: height, luma: luma}
+}
+
+func buildStickyScrollSamples(width, height, stickyHeight, offset int) (scrollSample, scrollSample) {
+	before := buildScrollSample(width, height, 0)
+	after := buildScrollSample(width, height, offset)
+	for y := 0; y < stickyHeight && y < height; y++ {
+		copy(after.luma[y*width:(y+1)*width], before.luma[y*width:(y+1)*width])
+	}
+	return before, after
+}
+
+func buildStickyFooterScrollSamples(width, height, footerHeight, offset int) (scrollSample, scrollSample) {
+	before := buildScrollSample(width, height, 0)
+	after := buildScrollSample(width, height, offset)
+	for y := max(0, height-footerHeight); y < height; y++ {
+		copy(after.luma[y*width:(y+1)*width], before.luma[y*width:(y+1)*width])
+	}
+	return before, after
+}
+
 func TestScrollModeUsesWindowHighlightBuffer(t *testing.T) {
 	s := &nativeSession{
 		imgBounds: image.Rect(0, 0, 2, 1),
@@ -81,6 +274,47 @@ func TestPaintBufferHighlightsVisibleFragments(t *testing.T) {
 				t.Fatalf("pixel %d,%d = %d, want %d", x, y, got[off], want)
 			}
 		}
+	}
+}
+
+func TestClientPointToImageUsesActualClientSize(t *testing.T) {
+	bounds := image.Rect(0, 0, 1920, 1080)
+	got := clientPointToImage(image.Pt(480, 270), 960, 540, bounds)
+	want := image.Pt(960, 540)
+	if got != want {
+		t.Fatalf("client point = %v, want %v", got, want)
+	}
+
+	got = clientPointToImage(image.Pt(2000, -20), 960, 540, bounds)
+	want = image.Pt(1920, 0)
+	if got != want {
+		t.Fatalf("clamped client point = %v, want %v", got, want)
+	}
+}
+
+func TestMagnifierSourceRectCentersOnCursorAndClamps(t *testing.T) {
+	bounds := image.Rect(0, 0, 200, 120)
+	if got := magnifierSourceRect(image.Pt(100, 60), 40, bounds); got != image.Rect(80, 40, 120, 80) {
+		t.Fatalf("centered source rect = %v", got)
+	}
+	if got := magnifierSourceRect(image.Pt(5, 5), 40, bounds); got != image.Rect(0, 0, 40, 40) {
+		t.Fatalf("top-left source rect = %v", got)
+	}
+	if got := magnifierSourceRect(image.Pt(199, 119), 40, bounds); got != image.Rect(160, 80, 200, 120) {
+		t.Fatalf("bottom-right source rect = %v", got)
+	}
+}
+
+func TestMagnifierDIBSourceYUsesBottomOriginForPartialStretch(t *testing.T) {
+	bounds := image.Rect(0, 0, 200, 120)
+	if got := magnifierDIBSourceY(image.Rect(0, 0, 40, 40), bounds); got != 80 {
+		t.Fatalf("top source DIB Y = %d, want 80", got)
+	}
+	if got := magnifierDIBSourceY(image.Rect(80, 40, 120, 80), bounds); got != 40 {
+		t.Fatalf("middle source DIB Y = %d, want 40", got)
+	}
+	if got := magnifierDIBSourceY(image.Rect(160, 80, 200, 120), bounds); got != 0 {
+		t.Fatalf("bottom source DIB Y = %d, want 0", got)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -13,6 +14,9 @@ import (
 
 	"gioui.org/app"
 	"gioui.org/f32"
+	"gioui.org/font"
+	"gioui.org/font/gofont"
+	"gioui.org/font/opentype"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
@@ -20,6 +24,7 @@ import (
 	"gioui.org/op"
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
+	"gioui.org/text"
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
@@ -41,7 +46,8 @@ const windowTitle = "InstantCapture"
 const (
 	minCanvasZoom             = 0.25
 	maxCanvasZoom             = 8.0
-	cropHandleScreenTolerance = 12
+	cropHandleScreenTolerance = 4
+	maxHotkeyCaptureKeys      = 3
 )
 
 type cropHandle uint8
@@ -88,9 +94,15 @@ type captureStartResult struct {
 }
 
 type scrollCaptureResult struct {
-	target platformwindows.WindowTarget
-	img    image.Image
-	err    error
+	target     platformwindows.WindowTarget
+	img        image.Image
+	screenRect image.Rectangle
+	err        error
+}
+
+type windowEventItem struct {
+	event event.Event
+	ack   chan struct{}
 }
 
 type windowUI struct {
@@ -139,8 +151,15 @@ type windowUI struct {
 	configPath             string
 	showSettings           bool
 	showModeDropdown       bool
+	hotkeyCaptureMode      bool
+	hotkeyCapturePressed   []string
+	hotkeyCaptureCandidate hotkey.Binding
+	hotkeyCaptureHasValue  bool
 	registrar              *hotkey.GlobalRegistrar
 	captureHotkey          func()
+	rebindHotkey           func(hotkey.Binding, func()) error
+	saveConfig             func(config.Config) error
+	copyPNG                func() error
 	trayHidden             bool
 	hasFocused             bool
 	trayAvailable          bool
@@ -162,6 +181,8 @@ type windowUI struct {
 	canvasZoom       float64
 	canvasPan        image.Point
 	canvasSourceSize image.Point
+	canvasPanning    bool
+	canvasPanLast    editor.Point
 	undoStack        []uiEditHistoryEntry
 	redoStack        []uiEditHistoryEntry
 
@@ -192,9 +213,10 @@ func RunMainWindow(ctx context.Context) error {
 		controller:             NewDefaultController(),
 		theme:                  newTheme(),
 		ctx:                    ctx,
-		status:                 fmt.Sprintf("Press %s or Capture Now to start.", cfg.Hotkey),
+		status:                 fmt.Sprintf("%s 또는 지금 캡처를 눌러 시작하세요.", cfg.Hotkey),
 		appConfig:              cfg,
 		configPath:             cfgPath,
+		saveConfig:             config.Save,
 		suppressFocusLossUntil: time.Now().Add(2 * time.Second),
 		overlayResults:         make(chan overlayResult, 1),
 		captureResults:         make(chan captureStartResult, 1),
@@ -206,7 +228,7 @@ func RunMainWindow(ctx context.Context) error {
 	ui.highlightWidthSlider.Value = highlighterWidthToSlider(ui.appConfig.HighlighterWidth)
 	ui.highlightAlphaSlider.Value = highlighterAlphaToSlider(ui.appConfig.HighlighterAlpha)
 	if cfgErr != nil {
-		ui.status = "Config load failed; using defaults: " + cfgErr.Error()
+		ui.status = "설정 로드 실패, 기본값을 사용합니다: " + cfgErr.Error()
 	}
 
 	hotkeyEvents := make(chan struct{}, 1)
@@ -215,7 +237,7 @@ func RunMainWindow(ctx context.Context) error {
 	trayEvents := make(chan tray.Event, 4)
 	trayIcon, trayErr := tray.Start(rawTrayEvents)
 	if trayErr != nil {
-		ui.status = "Tray init failed: " + trayErr.Error()
+		ui.status = "트레이 초기화 실패: " + trayErr.Error()
 	} else {
 		ui.trayAvailable = true
 		defer trayIcon.Stop()
@@ -251,6 +273,7 @@ func RunMainWindow(ctx context.Context) error {
 
 	registrar := hotkey.NewGlobalRegistrar()
 	ui.registrar = registrar
+	ui.rebindHotkey = registrar.RebindCapture
 	ui.captureHotkey = func() {
 		select {
 		case hotkeyEvents <- struct{}{}:
@@ -260,10 +283,11 @@ func RunMainWindow(ctx context.Context) error {
 	}
 	binding, _ := hotkey.ParseBinding(ui.appConfig.Hotkey)
 	if err := registrar.RegisterCaptureBinding(binding, ui.captureHotkey); err != nil {
-		ui.status = "Global hotkey registration failed: " + err.Error()
+		ui.status = "전역 단축키 등록 실패: " + err.Error()
 	} else {
 		defer registrar.Close()
 	}
+	windowEvents := forwardWindowEvents(ctx, w)
 	var ops op.Ops
 	for {
 		select {
@@ -274,10 +298,10 @@ func RunMainWindow(ctx context.Context) error {
 		case result := <-ui.captureResults:
 			ui.handleCaptureStartResult(result, w)
 		case result := <-ui.scrollResults:
-			ui.handleScrollCaptureResult(result)
+			ui.handleScrollCaptureResult(result, w)
 		case <-focusLossEvents:
 			if uShouldHideForFocusLoss(ui) {
-				ui.hideToTray("Hidden to tray after focus loss.", w)
+				ui.hideToTray("포커스를 잃어 트레이로 숨겼습니다.", w)
 			}
 		case event := <-trayEvents:
 			switch event {
@@ -288,30 +312,92 @@ func RunMainWindow(ctx context.Context) error {
 			}
 		case result := <-ui.overlayResults:
 			ui.handleOverlayResult(result, w)
-		default:
-		}
-
-		e := w.Event()
-		switch e := e.(type) {
-		case app.DestroyEvent:
-			return e.Err
-		case app.ConfigEvent:
-			ui.handleConfigEvent(e, w)
-		case app.FrameEvent:
-			gtx := app.NewContext(&ops, e)
-			ui.layout(gtx, w)
-			e.Frame(gtx.Ops)
+		case item := <-windowEvents:
+			shouldReturn, err := ui.handleWindowEvent(item.event, w, &ops)
+			close(item.ack)
+			if shouldReturn {
+				return err
+			}
 		}
 	}
 }
 
+func forwardWindowEvents(ctx context.Context, w *app.Window) <-chan windowEventItem {
+	events := make(chan windowEventItem, 1)
+	go func() {
+		for {
+			e := w.Event()
+			item := windowEventItem{event: e, ack: make(chan struct{})}
+			select {
+			case events <- item:
+			case <-ctx.Done():
+				return
+			}
+			select {
+			case <-item.ack:
+			case <-ctx.Done():
+				return
+			}
+			if _, ok := e.(app.DestroyEvent); ok {
+				return
+			}
+		}
+	}()
+	return events
+}
+
+func (u *windowUI) handleWindowEvent(e event.Event, w *app.Window, ops *op.Ops) (bool, error) {
+	switch e := e.(type) {
+	case app.DestroyEvent:
+		return true, e.Err
+	case app.ConfigEvent:
+		u.handleConfigEvent(e, w)
+	case app.FrameEvent:
+		gtx := app.NewContext(ops, e)
+		u.layout(gtx, w)
+		e.Frame(gtx.Ops)
+	}
+	return false, nil
+}
+
 func newTheme() *material.Theme {
 	theme := material.NewTheme()
+	theme.Face = font.Typeface("Malgun Gothic")
+	theme.Shaper = koreanTextShaper()
 	theme.Palette.Bg = color.NRGBA{R: 10, G: 15, B: 28, A: 255}
 	theme.Palette.Fg = color.NRGBA{R: 235, G: 241, B: 250, A: 255}
 	theme.Palette.ContrastBg = color.NRGBA{R: 45, G: 212, B: 191, A: 255}
 	theme.Palette.ContrastFg = color.NRGBA{R: 255, G: 255, B: 255, A: 255}
 	return theme
+}
+
+func koreanTextShaper() *text.Shaper {
+	faces := append([]font.FontFace{}, gofont.Collection()...)
+	for _, path := range koreanFontPaths() {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		parsed, err := opentype.ParseCollection(data)
+		if err != nil {
+			continue
+		}
+		faces = append(faces, parsed...)
+	}
+	return text.NewShaper(text.WithCollection(faces))
+}
+
+func koreanFontPaths() []string {
+	windir := os.Getenv("WINDIR")
+	if windir == "" {
+		windir = `C:\Windows`
+	}
+	fonts := filepath.Join(windir, "Fonts")
+	return []string{
+		filepath.Join(fonts, "malgun.ttf"),
+		filepath.Join(fonts, "malgunbd.ttf"),
+		filepath.Join(fonts, "malgunsl.ttf"),
+	}
 }
 
 func NewDefaultController() *workflow.Controller {
@@ -320,7 +406,17 @@ func NewDefaultController() *workflow.Controller {
 
 func (u *windowUI) layout(gtx layout.Context, w *app.Window) layout.Dimensions {
 	paint.Fill(gtx.Ops, color.NRGBA{R: 8, G: 13, B: 26, A: 255})
-	if !u.showSettings && !u.showModeDropdown {
+	if u.hotkeyCaptureMode {
+		event.Op(gtx.Ops, &u.keyTag)
+		gtx.Execute(key.FocusCmd{Tag: &u.keyTag})
+		u.handleHotkeyCapture(gtx)
+		if u.hotkeyCaptureMode {
+			u.syncNativeHotkeyCaptureKeys(platformwindows.PressedSpecialShortcutKeys())
+		}
+		if u.hotkeyCaptureMode {
+			gtx.Execute(op.InvalidateCmd{At: time.Now().Add(16 * time.Millisecond)})
+		}
+	} else if !u.showSettings && !u.showModeDropdown {
 		event.Op(gtx.Ops, &u.keyTag)
 		gtx.Execute(key.FocusCmd{Tag: &u.keyTag})
 		u.handleShortcuts(gtx)
@@ -352,11 +448,11 @@ func (u *windowUI) layout(gtx layout.Context, w *app.Window) layout.Dimensions {
 }
 
 func (u *windowUI) layoutToolbar(gtx layout.Context) layout.Dimensions {
-	barHeight := gtx.Dp(unit.Dp(60))
+	barHeight := gtx.Dp(unit.Dp(68))
 	gtx.Constraints.Min.Y = barHeight
 	gtx.Constraints.Max.Y = barHeight
 	paint.FillShape(gtx.Ops, color.NRGBA{R: 13, G: 20, B: 38, A: 255}, clip.Rect{Max: gtx.Constraints.Max}.Op())
-	return layout.Inset{Top: unit.Dp(12), Bottom: unit.Dp(12), Left: unit.Dp(14), Right: unit.Dp(14)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+	return layout.Inset{Top: unit.Dp(10), Bottom: unit.Dp(10), Left: unit.Dp(14), Right: unit.Dp(14)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Gap: gtx.Dp(unit.Dp(10))}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Right: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -366,10 +462,10 @@ func (u *windowUI) layoutToolbar(gtx layout.Context) layout.Dimensions {
 				})
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return toggleButton(u.theme, &u.captureModeButton, "Mode: "+u.appConfig.CaptureMode, true).Layout(gtx)
+				return toggleButton(u.theme, &u.captureModeButton, "모드: "+modeLabel(u.appConfig.CaptureMode), true).Layout(gtx)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return accentButton(u.theme, &u.newCaptureButton, "Capture Now").Layout(gtx)
+				return accentButton(u.theme, &u.newCaptureButton, "지금 캡처").Layout(gtx)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return u.iconToolButton(gtx, &u.rectButton, editor.ToolRectangle)
@@ -387,16 +483,16 @@ func (u *windowUI) layoutToolbar(gtx layout.Context) layout.Dimensions {
 				return u.iconToolButton(gtx, &u.highlightButton, editor.ToolHighlight)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return neutralButton(u.theme, &u.copyButton, "Copy").Layout(gtx)
+				return neutralButton(u.theme, &u.copyButton, "복사").Layout(gtx)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return neutralButton(u.theme, &u.saveButton, "Save").Layout(gtx)
+				return neutralButton(u.theme, &u.saveButton, "저장").Layout(gtx)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return neutralButton(u.theme, &u.settingsButton, "Settings").Layout(gtx)
+				return neutralButton(u.theme, &u.settingsButton, "설정").Layout(gtx)
 			}),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-				label := material.Body2(u.theme, "Tool: "+string(u.activeTool))
+				label := material.Body2(u.theme, "도구: "+toolLabel(u.activeTool))
 				label.Color = color.NRGBA{R: 171, G: 184, B: 205, A: 255}
 				return label.Layout(gtx)
 			}),
@@ -415,7 +511,7 @@ func (u *windowUI) layoutToast(gtx layout.Context) {
 	if x < 0 {
 		x = 0
 	}
-	y := gtx.Dp(unit.Dp(74))
+	y := gtx.Dp(unit.Dp(82))
 	defer op.Offset(image.Pt(x, y)).Push(gtx.Ops).Pop()
 	rect := image.Rectangle{Max: image.Pt(width, height)}
 	paint.FillShape(gtx.Ops, color.NRGBA{R: 15, G: 23, B: 42, A: 252}, clip.RRect{Rect: rect, SE: 14, SW: 14, NW: 14, NE: 14}.Op(gtx.Ops))
@@ -461,7 +557,7 @@ func (u *windowUI) layoutModeDropdown(gtx layout.Context) layout.Dimensions {
 		for i := range modes {
 			idx := i
 			children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return toggleButton(u.theme, &u.captureModeItems[idx], modes[idx], u.appConfig.CaptureMode == modes[idx]).Layout(gtx)
+				return toggleButton(u.theme, &u.captureModeItems[idx], modeLabel(modes[idx]), u.appConfig.CaptureMode == modes[idx]).Layout(gtx)
 			}))
 		}
 		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Gap: gtx.Dp(unit.Dp(8))}.Layout(gtx, children...)
@@ -475,18 +571,18 @@ func (u *windowUI) layoutSettings(gtx layout.Context) layout.Dimensions {
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Gap: gtx.Dp(unit.Dp(12))}.Layout(gtx,
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						label := material.Body1(u.theme, "Settings")
+						label := material.Body1(u.theme, "설정")
 						label.Color = color.NRGBA{R: 226, G: 232, B: 240, A: 255}
 						return label.Layout(gtx)
 					}),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return toggleButton(u.theme, &u.hotkeyButton, "Hotkey: "+u.appConfig.Hotkey, true).Layout(gtx)
+						return toggleButton(u.theme, &u.hotkeyButton, u.hotkeyButtonLabel(), true).Layout(gtx)
 					}),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return toggleButton(u.theme, &u.hideMinButton, "Minimize to tray: "+onOff(u.appConfig.HideOnMinimize), u.appConfig.HideOnMinimize).Layout(gtx)
+						return toggleButton(u.theme, &u.hideMinButton, "최소화 시 트레이: "+onOff(u.appConfig.HideOnMinimize), u.appConfig.HideOnMinimize).Layout(gtx)
 					}),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return toggleButton(u.theme, &u.hideFocusButton, "Focus-loss tray: "+onOff(u.appConfig.HideOnFocusLoss), u.appConfig.HideOnFocusLoss).Layout(gtx)
+						return toggleButton(u.theme, &u.hideFocusButton, "포커스 해제 시 트레이: "+onOff(u.appConfig.HideOnFocusLoss), u.appConfig.HideOnFocusLoss).Layout(gtx)
 					}),
 				)
 			}),
@@ -511,23 +607,23 @@ func (u *windowUI) layoutSaveSettings(gtx layout.Context) layout.Dimensions {
 	}
 	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Gap: gtx.Dp(unit.Dp(10))}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			label := material.Body2(u.theme, "Save")
+			label := material.Body2(u.theme, "저장")
 			label.Color = color.NRGBA{R: 148, G: 163, B: 184, A: 255}
 			return label.Layout(gtx)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return toggleButton(u.theme, &u.autoSaveButton, "Auto save: "+onOff(u.appConfig.AutoSave), u.appConfig.AutoSave).Layout(gtx)
+			return toggleButton(u.theme, &u.autoSaveButton, "자동 저장: "+onOff(u.appConfig.AutoSave), u.appConfig.AutoSave).Layout(gtx)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints.Min.X = gtx.Dp(unit.Dp(430))
 			gtx.Constraints.Max.X = gtx.Dp(unit.Dp(430))
-			return material.Editor(u.theme, &u.saveDirEditor, "Save folder").Layout(gtx)
+			return material.Editor(u.theme, &u.saveDirEditor, "저장 폴더").Layout(gtx)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return neutralButton(u.theme, &u.saveDirApplyButton, "Apply").Layout(gtx)
+			return neutralButton(u.theme, &u.saveDirApplyButton, "적용").Layout(gtx)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return neutralButton(u.theme, &u.saveDirBrowseButton, "Browse...").Layout(gtx)
+			return neutralButton(u.theme, &u.saveDirBrowseButton, "찾아보기...").Layout(gtx)
 		}),
 	)
 }
@@ -542,7 +638,7 @@ func (u *windowUI) layoutStyleSettings(gtx layout.Context) layout.Dimensions {
 	oldWidth := u.appConfig.StrokeWidth
 	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Gap: gtx.Dp(unit.Dp(10))}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			label := material.Body2(u.theme, "Border")
+			label := material.Body2(u.theme, "테두리")
 			label.Color = color.NRGBA{R: 148, G: 163, B: 184, A: 255}
 			return label.Layout(gtx)
 		}),
@@ -571,7 +667,7 @@ func (u *windowUI) layoutStyleSettings(gtx layout.Context) layout.Dimensions {
 			return material.Editor(u.theme, &u.rgbEditor, "R,G,B").Layout(gtx)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return neutralButton(u.theme, &u.rgbApplyButton, "Apply RGB").Layout(gtx)
+			return neutralButton(u.theme, &u.rgbApplyButton, "RGB 적용").Layout(gtx)
 		}),
 	)
 }
@@ -581,7 +677,7 @@ func (u *windowUI) layoutHighlighterSettings(gtx layout.Context) layout.Dimensio
 	oldAlpha := u.appConfig.HighlighterAlpha
 	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Gap: gtx.Dp(unit.Dp(10))}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			label := material.Body2(u.theme, "Highlighter")
+			label := material.Body2(u.theme, "형광펜")
 			label.Color = color.NRGBA{R: 148, G: 163, B: 184, A: 255}
 			return label.Layout(gtx)
 		}),
@@ -597,7 +693,7 @@ func (u *windowUI) layoutHighlighterSettings(gtx layout.Context) layout.Dimensio
 			return dims
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			label := material.Body2(u.theme, fmt.Sprintf("Width %dpx", u.appConfig.HighlighterWidth))
+			label := material.Body2(u.theme, fmt.Sprintf("두께 %dpx", u.appConfig.HighlighterWidth))
 			label.Color = color.NRGBA{R: 226, G: 232, B: 240, A: 255}
 			return label.Layout(gtx)
 		}),
@@ -613,7 +709,7 @@ func (u *windowUI) layoutHighlighterSettings(gtx layout.Context) layout.Dimensio
 			return dims
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			label := material.Body2(u.theme, fmt.Sprintf("Opacity %d%%", u.appConfig.HighlighterAlpha*100/255))
+			label := material.Body2(u.theme, fmt.Sprintf("불투명도 %d%%", u.appConfig.HighlighterAlpha*100/255))
 			label.Color = color.NRGBA{R: 226, G: 232, B: 240, A: 255}
 			return label.Layout(gtx)
 		}),
@@ -653,7 +749,7 @@ func (u *windowUI) handleConfigEvent(e app.ConfigEvent, w *app.Window) {
 		return
 	}
 	if u.appConfig.HideOnMinimize && e.Config.Mode == app.Minimized {
-		u.hideToTray("Hidden to tray after minimize.", w)
+		u.hideToTray("최소화되어 트레이로 숨겼습니다.", w)
 	}
 }
 
@@ -670,7 +766,7 @@ func uShouldHideForFocusLoss(u *windowUI) bool {
 
 func (u *windowUI) hideToTray(message string, w *app.Window) {
 	if err := platformwindows.HideWindowByTitle(windowTitle); err != nil {
-		u.status = "Hide to tray failed: " + err.Error()
+		u.status = "트레이로 숨기기 실패: " + err.Error()
 		return
 	}
 	u.trayHidden = true
@@ -785,9 +881,60 @@ func drawIconPolyline(ops *op.Ops, points []f32.Point, c color.NRGBA, width floa
 
 func onOff(enabled bool) string {
 	if enabled {
-		return "ON"
+		return "켬"
 	}
-	return "OFF"
+	return "끔"
+}
+
+func modeLabel(mode string) string {
+	switch mode {
+	case "Region":
+		return "영역"
+	case "Window":
+		return "창"
+	case "Scroll":
+		return "스크롤"
+	case "Freeform":
+		return "자유형"
+	case "Fullscreen":
+		return "전체화면"
+	default:
+		return mode
+	}
+}
+
+func toolLabel(tool editor.Tool) string {
+	switch tool {
+	case editor.ToolPen:
+		return "펜"
+	case editor.ToolRectangle:
+		return "사각형"
+	case editor.ToolArrow:
+		return "화살표"
+	case editor.ToolLine:
+		return "선"
+	case editor.ToolHighlight:
+		return "형광펜"
+	default:
+		return string(tool)
+	}
+}
+
+func colorLabel(name string) string {
+	switch name {
+	case "Red":
+		return "빨강"
+	case "Cyan":
+		return "하늘"
+	case "Yellow":
+		return "노랑"
+	case "Green":
+		return "초록"
+	case "White":
+		return "흰색"
+	default:
+		return name
+	}
 }
 
 func (u *windowUI) applyStrokeStyle() {
@@ -992,7 +1139,7 @@ func (u *windowUI) layoutCanvas(gtx layout.Context, w *app.Window) layout.Dimens
 	case workflow.ModeEditing:
 		rendered, err := u.controller.PreviewImage()
 		if err != nil {
-			u.status = "Render failed: " + err.Error()
+			u.status = "렌더링 실패: " + err.Error()
 			img = u.controller.CapturedImage
 		} else {
 			img = rendered
@@ -1037,20 +1184,20 @@ func (u *windowUI) layoutEmptyCanvas(gtx layout.Context, size image.Point) layou
 		return layout.UniformInset(unit.Dp(24)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					label := material.H5(u.theme, "Ready to capture")
+					label := material.H5(u.theme, "캡처 준비 완료")
 					label.Color = color.NRGBA{R: 240, G: 249, B: 255, A: 255}
 					return label.Layout(gtx)
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return layout.Inset{Top: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-						label := material.Body1(u.theme, "Press the global hotkey or Capture Now, then drag the region to annotate.")
+						label := material.Body1(u.theme, "전역 단축키나 지금 캡처를 누른 뒤 영역을 드래그해 주석을 추가하세요.")
 						label.Color = color.NRGBA{R: 148, G: 163, B: 184, A: 255}
 						return label.Layout(gtx)
 					})
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return layout.Inset{Top: unit.Dp(18)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-						return accentButton(u.theme, &u.newCaptureButton, "Capture Now").Layout(gtx)
+						return accentButton(u.theme, &u.newCaptureButton, "지금 캡처").Layout(gtx)
 					})
 				}),
 			)
@@ -1065,27 +1212,27 @@ func (u *windowUI) handleButtons(gtx layout.Context, w *app.Window) {
 	for u.penButton.Clicked(gtx) {
 		u.activeTool = editor.ToolPen
 		_ = u.controller.Editor.SetActiveTool(editor.ToolPen)
-		u.status = "Tool: Pen"
+		u.status = "도구: 펜"
 	}
 	for u.rectButton.Clicked(gtx) {
 		u.activeTool = editor.ToolRectangle
 		_ = u.controller.Editor.SetActiveTool(editor.ToolRectangle)
-		u.status = "Tool: Rectangle"
+		u.status = "도구: 사각형"
 	}
 	for u.arrowButton.Clicked(gtx) {
 		u.activeTool = editor.ToolArrow
 		_ = u.controller.Editor.SetActiveTool(editor.ToolArrow)
-		u.status = "Tool: Arrow"
+		u.status = "도구: 화살표"
 	}
 	for u.lineButton.Clicked(gtx) {
 		u.activeTool = editor.ToolLine
 		_ = u.controller.Editor.SetActiveTool(editor.ToolLine)
-		u.status = "Tool: Line"
+		u.status = "도구: 선"
 	}
 	for u.highlightButton.Clicked(gtx) {
 		u.activeTool = editor.ToolHighlight
 		_ = u.controller.Editor.SetActiveTool(editor.ToolHighlight)
-		u.status = "Tool: Highlighter"
+		u.status = "도구: 형광펜"
 	}
 	for u.copyButton.Clicked(gtx) {
 		u.copyCurrentImage()
@@ -1097,35 +1244,39 @@ func (u *windowUI) handleButtons(gtx layout.Context, w *app.Window) {
 		u.showSettings = !u.showSettings
 		if u.showSettings {
 			u.showModeDropdown = false
+		} else {
+			u.cancelHotkeyCapture("단축키 지정을 취소했습니다.")
 		}
 	}
 	for u.captureModeButton.Clicked(gtx) {
 		u.showModeDropdown = !u.showModeDropdown
 		if u.showModeDropdown {
 			u.showSettings = false
+			u.cancelHotkeyCapture("단축키 지정을 취소했습니다.")
 		}
 	}
 	for i, mode := range []string{"Region", "Window", "Scroll", "Freeform", "Fullscreen"} {
 		for u.captureModeItems[i].Clicked(gtx) {
 			u.appConfig.CaptureMode = mode
 			u.showModeDropdown = false
-			u.saveConfigStatus("Capture mode changed: " + mode)
+			u.saveConfigStatus("캡처 모드 변경: " + modeLabel(mode))
 		}
 	}
 	for u.hotkeyButton.Clicked(gtx) {
-		u.cycleHotkey()
+		u.beginHotkeyCapture()
+		w.Invalidate()
 	}
 	for u.hideMinButton.Clicked(gtx) {
 		u.appConfig.HideOnMinimize = !u.appConfig.HideOnMinimize
-		u.saveConfigStatus("Minimize-to-tray changed: " + onOff(u.appConfig.HideOnMinimize))
+		u.saveConfigStatus("최소화 시 트레이 설정: " + onOff(u.appConfig.HideOnMinimize))
 	}
 	for u.hideFocusButton.Clicked(gtx) {
 		u.appConfig.HideOnFocusLoss = !u.appConfig.HideOnFocusLoss
-		u.saveConfigStatus("Focus-loss tray changed: " + onOff(u.appConfig.HideOnFocusLoss))
+		u.saveConfigStatus("포커스 해제 시 트레이 설정: " + onOff(u.appConfig.HideOnFocusLoss))
 	}
 	for u.autoSaveButton.Clicked(gtx) {
 		u.appConfig.AutoSave = !u.appConfig.AutoSave
-		u.saveConfigStatus("Auto save changed: " + onOff(u.appConfig.AutoSave))
+		u.saveConfigStatus("자동 저장 설정: " + onOff(u.appConfig.AutoSave))
 	}
 	for u.saveDirApplyButton.Clicked(gtx) {
 		u.applySaveDirText()
@@ -1136,15 +1287,15 @@ func (u *windowUI) handleButtons(gtx layout.Context, w *app.Window) {
 	for i, preset := range strokePresets() {
 		for u.paletteButtons[i].Clicked(gtx) {
 			u.setStrokeColor(preset.name)
-			u.saveConfigStatus("Border color changed: " + preset.name)
+			u.saveConfigStatus("테두리 색상 변경: " + colorLabel(preset.name))
 		}
 	}
 	for u.rgbApplyButton.Clicked(gtx) {
 		if rgb, ok := parseRGBText(u.rgbEditor.Text()); ok {
 			u.setStrokeColor(rgbName(rgb))
-			u.saveConfigStatus("Border RGB changed: " + u.appConfig.StrokeColor)
+			u.saveConfigStatus("테두리 RGB 변경: " + u.appConfig.StrokeColor)
 		} else {
-			u.status = "RGB format must be R,G,B such as 255,64,64."
+			u.status = "RGB 형식은 255,64,64처럼 R,G,B로 입력하세요."
 		}
 	}
 }
@@ -1175,12 +1326,38 @@ func (u *windowUI) handleShortcuts(gtx layout.Context) {
 	}
 }
 
+func (u *windowUI) handleHotkeyCapture(gtx layout.Context) {
+	filters := hotkeyCaptureFilters(&u.keyTag)
+	for {
+		ev, ok := gtx.Event(filters...)
+		if !ok {
+			break
+		}
+		ke, ok := ev.(key.Event)
+		if !ok {
+			continue
+		}
+		u.handleShortcutKey(ke)
+	}
+}
+
+func hotkeyCaptureFilters(tag event.Tag) []event.Filter {
+	return []event.Filter{
+		key.FocusFilter{Target: tag},
+		key.Filter{Focus: tag, Name: key.NameEscape, Optional: allShortcutModifiers()},
+		key.Filter{Focus: tag, Name: "", Optional: allShortcutModifiers()},
+	}
+}
+
 func (u *windowUI) handleShortcutKey(ke key.Event) bool {
+	if u.hotkeyCaptureMode {
+		return u.handleHotkeyCaptureKey(ke)
+	}
 	switch strings.ToUpper(string(ke.Name)) {
 	case string(key.NameEscape):
 		u.dragging = false
 		u.cropDragging = false
-		u.status = "Current gesture canceled."
+		u.status = "현재 동작을 취소했습니다."
 		return true
 	case "S":
 		if ke.Modifiers.Contain(key.ModShortcut) {
@@ -1210,10 +1387,58 @@ func (u *windowUI) handleShortcutKey(ke key.Event) bool {
 	return false
 }
 
+func (u *windowUI) handleHotkeyCaptureKey(ke key.Event) bool {
+	if ke.Name == key.NameEscape && ke.State == key.Press {
+		u.cancelHotkeyCapture("단축키 지정을 취소했습니다.")
+		return true
+	}
+	switch ke.State {
+	case key.Press:
+		u.recordHotkeyCapturePress(ke)
+	case key.Release:
+		u.recordHotkeyCaptureRelease(ke)
+	default:
+		return false
+	}
+	return true
+}
+
+func (u *windowUI) recordHotkeyCapturePress(ke key.Event) {
+	for _, modifier := range hotkeyCaptureModifierNames(ke.Modifiers) {
+		if !u.addHotkeyCaptureKey(modifier) {
+			u.status = fmt.Sprintf("단축키는 최대 %d개 키까지 입력할 수 있습니다.", maxHotkeyCaptureKeys)
+			return
+		}
+	}
+	name := hotkeyCaptureEventKeyName(ke.Name)
+	if name != "" {
+		if !u.addHotkeyCaptureKey(name) {
+			u.status = fmt.Sprintf("단축키는 최대 %d개 키까지 입력할 수 있습니다.", maxHotkeyCaptureKeys)
+			return
+		}
+	}
+	u.updateHotkeyCapturePreview()
+}
+
+func (u *windowUI) recordHotkeyCaptureRelease(ke key.Event) {
+	if name := hotkeyCaptureEventKeyName(ke.Name); name != "" {
+		u.removeHotkeyCaptureKey(name)
+	}
+	if len(u.hotkeyCapturePressed) == 0 {
+		if u.hotkeyCaptureHasValue {
+			u.applyHotkeyBinding(u.hotkeyCaptureCandidate)
+			return
+		}
+		u.status = "Ctrl/Alt/Shift와 함께 사용할 키를 눌러주세요. Esc로 취소할 수 있습니다."
+		return
+	}
+	u.updateHotkeyCapturePreview()
+}
+
 func (u *windowUI) saveCurrentImage() {
-	path, err := u.saveCurrentImageWithStatus("Saved PNG")
+	path, err := u.saveCurrentImageWithStatus("PNG 저장 완료")
 	if err == nil {
-		u.status = "Saved: " + path
+		u.status = "저장 완료: " + path
 	}
 }
 
@@ -1221,8 +1446,8 @@ func (u *windowUI) saveCurrentImageWithStatus(toastTitle string) (string, error)
 	dir := u.configuredSaveDir()
 	path, err := u.controller.SavePNG(dir)
 	if err != nil {
-		u.status = "Save failed: " + err.Error()
-		u.showToastDetail("Save failed", err.Error())
+		u.status = "저장 실패: " + err.Error()
+		u.showToastDetail("저장 실패", err.Error())
 		return "", err
 	}
 	u.showToastDetail(toastTitle, toastSavePath(path))
@@ -1233,11 +1458,11 @@ func (u *windowUI) autoSaveCurrentImage() {
 	if !u.appConfig.AutoSave {
 		return
 	}
-	path, err := u.saveCurrentImageWithStatus("Auto-saved PNG")
+	path, err := u.saveCurrentImageWithStatus("PNG 자동 저장 완료")
 	if err != nil {
 		return
 	}
-	u.status = "Auto-saved: " + path
+	u.status = "자동 저장 완료: " + path
 }
 
 func (u *windowUI) configuredSaveDir() string {
@@ -1257,28 +1482,28 @@ func (u *windowUI) applySaveDirText() {
 	u.appConfig.SaveDir = dir
 	if dir == "" {
 		u.saveDirEditor.SetText(defaultSaveDir())
-		u.saveConfigStatus("Save folder reset to default.")
+		u.saveConfigStatus("저장 폴더를 기본값으로 되돌렸습니다.")
 	} else {
 		u.saveDirEditor.SetText(dir)
-		u.saveConfigStatus("Save folder changed: " + dir)
+		u.saveConfigStatus("저장 폴더 변경: " + dir)
 	}
 }
 
 func (u *windowUI) chooseSaveDir() {
 	dir, ok, err := platformwindows.PickFolder(u.configuredSaveDir())
 	if err != nil {
-		u.status = "Folder picker failed: " + err.Error()
-		u.showToastDetail("Folder picker failed", err.Error())
+		u.status = "폴더 선택 실패: " + err.Error()
+		u.showToastDetail("폴더 선택 실패", err.Error())
 		return
 	}
 	if !ok {
-		u.status = "Folder selection canceled."
+		u.status = "폴더 선택을 취소했습니다."
 		return
 	}
 	dir = config.NormalizeSaveDir(dir)
 	u.appConfig.SaveDir = dir
 	u.saveDirEditor.SetText(dir)
-	u.saveConfigStatus("Save folder changed: " + dir)
+	u.saveConfigStatus("저장 폴더 변경: " + dir)
 }
 
 func toastSavePath(path string) string {
@@ -1295,30 +1520,48 @@ func defaultSaveDir() string {
 }
 
 func (u *windowUI) copyCurrentImage() {
-	if err := u.controller.CopyPNG(); err != nil {
-		u.status = "Copy failed: " + err.Error()
-		u.showToastDetail("Copy failed", err.Error())
+	if err := u.copyPNGCurrentImage(); err != nil {
+		u.status = "복사 실패: " + err.Error()
+		u.showToastDetail("복사 실패", err.Error())
 	} else {
-		u.status = "Copied PNG to clipboard."
-		u.showToastDetail("Copied PNG", "Image is now on the clipboard")
+		u.status = "PNG를 클립보드에 복사했습니다."
+		u.showToastDetail("PNG 복사 완료", "이미지가 클립보드에 들어갔습니다")
 	}
+}
+
+func (u *windowUI) copyPNGCurrentImage() error {
+	if u.copyPNG != nil {
+		return u.copyPNG()
+	}
+	return u.controller.CopyPNG()
+}
+
+func (u *windowUI) finishCaptureReadyWithInitialCopy(status string) {
+	u.autoCopyPending = true
+	if err := u.copyPNGCurrentImage(); err != nil {
+		u.status = status + " 최초 복사 실패: " + err.Error()
+		u.showToastDetail("최초 복사 실패", err.Error())
+		return
+	}
+	u.status = status + " 첫 캡처를 클립보드에 복사했습니다."
+	u.showToastDetail("캡처 복사 완료", "첫 캡처 이미지를 클립보드에 복사했습니다")
 }
 
 func (u *windowUI) undoEdit() {
 	if u.undoLastEdit() {
-		u.status = "Undo."
-		u.showToast("Undo")
+		u.status = "실행 취소했습니다."
+		u.showToast("실행 취소")
 	} else {
-		u.showToast("Nothing to undo")
+		u.showToast("실행 취소할 항목이 없습니다")
 	}
 }
 
 func (u *windowUI) redoEdit() {
 	if u.redoLastEdit() {
-		u.status = "Redo."
-		u.showToast("Redo")
+		u.status = "다시 실행했습니다."
+		u.showToast("다시 실행")
 	} else {
-		u.showToast("Nothing to redo")
+		u.showToast("다시 실행할 항목이 없습니다")
 	}
 }
 
@@ -1406,6 +1649,7 @@ func (u *windowUI) restoreCanvasView(state canvasViewState) {
 	u.canvasZoom = state.Zoom
 	u.canvasPan = state.Pan
 	u.canvasSourceSize = state.SourceSize
+	u.canvasPanning = false
 	u.cropDragging = false
 	u.cropHoverHandle = cropHandleNone
 	u.cropDragHandle = cropHandleNone
@@ -1495,10 +1739,14 @@ func (u *windowUI) zoomCanvas(scrollY float32, anchor editor.Point, canvasBounds
 	)
 	u.canvasPan = clampCanvasPan(desiredMin.Sub(centeredMin), centeredMin, viewSize, canvasBounds)
 	u.recordCanvasViewEdit(before, u.captureCanvasView())
-	u.status = fmt.Sprintf("Zoom: %.0f%%", u.canvasZoom*100)
+	u.status = fmt.Sprintf("확대: %.0f%%", u.canvasZoom*100)
 }
 
 func (u *windowUI) addCanvasCursor(ops *op.Ops) {
+	if u.canvasPanning {
+		pointer.CursorAllScroll.Add(ops)
+		return
+	}
 	handle := u.cropHoverHandle
 	if u.cropDragging {
 		handle = u.cropDragHandle
@@ -1517,16 +1765,42 @@ func (u *windowUI) addCanvasCursor(ops *op.Ops) {
 	}
 }
 
+func isCanvasPanButton(buttons pointer.Buttons) bool {
+	return buttons.Contain(pointer.ButtonTertiary)
+}
+
+func (u *windowUI) panCanvasBySourceDelta(from, to editor.Point, canvasBounds image.Rectangle, viewport coords.Viewport) bool {
+	if viewport.Scale <= 0 || viewport.View.Empty() || canvasBounds.Empty() {
+		return false
+	}
+	delta := image.Pt(
+		int(math.Round(float64(to.X-from.X)*viewport.Scale)),
+		int(math.Round(float64(to.Y-from.Y)*viewport.Scale)),
+	)
+	if delta == (image.Point{}) {
+		return false
+	}
+	centeredMin := viewport.View.Min.Sub(u.canvasPan)
+	next := clampCanvasPan(u.canvasPan.Add(delta), centeredMin, viewport.View.Size(), canvasBounds)
+	if next == u.canvasPan {
+		return false
+	}
+	u.canvasPan = next
+	return true
+}
+
 func (u *windowUI) hitCropHandle(point editor.Point, bounds image.Rectangle, scale float64) cropHandle {
 	if u.controller.Mode != workflow.ModeEditing || scale <= 0 || bounds.Empty() {
 		return cropHandleNone
 	}
-	tolerance := max(2, int(math.Ceil(cropHandleScreenTolerance/scale)))
+	tolerance := cropHandleSourceTolerance(scale)
 	x, y := point.X, point.Y
-	nearLeft := absInt(x-bounds.Min.X) <= tolerance
-	nearRight := absInt(x-bounds.Max.X) <= tolerance
-	nearTop := absInt(y-bounds.Min.Y) <= tolerance
-	nearBottom := absInt(y-bounds.Max.Y) <= tolerance
+	withinVerticalSpan := y >= bounds.Min.Y-tolerance && y <= bounds.Max.Y+tolerance
+	withinHorizontalSpan := x >= bounds.Min.X-tolerance && x <= bounds.Max.X+tolerance
+	nearLeft := withinVerticalSpan && absInt(x-bounds.Min.X) <= tolerance
+	nearRight := withinVerticalSpan && absInt(x-bounds.Max.X) <= tolerance
+	nearTop := withinHorizontalSpan && absInt(y-bounds.Min.Y) <= tolerance
+	nearBottom := withinHorizontalSpan && absInt(y-bounds.Max.Y) <= tolerance
 	var handle cropHandle
 	if nearLeft {
 		handle |= cropHandleLeft
@@ -1539,6 +1813,13 @@ func (u *windowUI) hitCropHandle(point editor.Point, bounds image.Rectangle, sca
 		handle |= cropHandleBottom
 	}
 	return handle
+}
+
+func cropHandleSourceTolerance(scale float64) int {
+	if scale <= 0 {
+		return 0
+	}
+	return max(0, int(math.Floor(cropHandleScreenTolerance/scale)))
 }
 
 func (u *windowUI) updateCropPreview(point editor.Point, bounds image.Rectangle) {
@@ -1565,26 +1846,39 @@ func minCropSize(bounds image.Rectangle) int {
 
 func (u *windowUI) commitCropPreview() {
 	if u.cropPreviewRect.Empty() || u.cropPreviewRect.Eq(u.cropStartRect) {
-		u.status = "Crop canceled."
+		u.status = "자르기를 취소했습니다."
 		return
 	}
 	viewBefore := u.captureCanvasView()
 	if err := u.controller.CropCapturedImage(u.cropPreviewRect); err != nil {
-		u.status = "Crop failed: " + err.Error()
+		u.status = "자르기 실패: " + err.Error()
 		u.showToast(u.status)
 		return
 	}
 	croppedSize := u.cropPreviewRect.Size()
 	u.resetCanvasView()
 	u.recordControllerEdit(viewBefore, u.captureCanvasView())
-	u.status = fmt.Sprintf("Cropped to %dx%d.", croppedSize.X, croppedSize.Y)
-	u.showToast("Image cropped")
+	status := fmt.Sprintf("%dx%d 크기로 잘랐습니다.", croppedSize.X, croppedSize.Y)
+	if u.autoCopyPending {
+		u.autoCopyPending = false
+		if err := u.copyPNGCurrentImage(); err != nil {
+			u.status = status + " 자동 복사 실패: " + err.Error()
+			u.showToast("자동 복사 실패")
+			return
+		}
+		u.status = status + " 클립보드에 복사했습니다."
+		u.showToast("첫 변경 후 복사 완료")
+		return
+	}
+	u.status = status
+	u.showToast("이미지를 잘랐습니다")
 }
 
 func (u *windowUI) resetCanvasView() {
 	u.canvasZoom = 1
 	u.canvasPan = image.Point{}
 	u.canvasSourceSize = image.Point{}
+	u.canvasPanning = false
 	u.cropDragging = false
 	u.cropHoverHandle = cropHandleNone
 	u.cropDragHandle = cropHandleNone
@@ -1663,20 +1957,280 @@ func absInt(v int) int {
 
 func (u *windowUI) cycleHotkey() {
 	binding := hotkey.NextPreset(u.appConfig.Hotkey)
-	if err := u.registrar.RebindCapture(binding, u.captureHotkey); err != nil {
-		u.status = "Hotkey change failed: " + err.Error()
+	u.applyHotkeyBinding(binding)
+}
+
+func (u *windowUI) hotkeyButtonLabel() string {
+	if u.hotkeyCaptureMode {
+		if u.hotkeyCaptureHasValue {
+			return "단축키 입력 중: " + u.hotkeyCaptureCandidate.Name
+		}
+		if combo := strings.Join(u.hotkeyCapturePressed, "+"); combo != "" {
+			return "단축키 입력 중: " + combo
+		}
+		return "단축키 입력 중..."
+	}
+	return "단축키: " + u.appConfig.Hotkey
+}
+
+func (u *windowUI) beginHotkeyCapture() {
+	u.hotkeyCaptureMode = true
+	u.hotkeyCapturePressed = nil
+	u.hotkeyCaptureCandidate = hotkey.Binding{}
+	u.hotkeyCaptureHasValue = false
+	u.status = "새 단축키를 눌러주세요. Esc로 취소할 수 있습니다."
+	u.showToast("새 단축키를 눌러주세요")
+}
+
+func (u *windowUI) cancelHotkeyCapture(message string) {
+	if !u.hotkeyCaptureMode {
 		return
 	}
+	u.hotkeyCaptureMode = false
+	u.hotkeyCapturePressed = nil
+	u.hotkeyCaptureCandidate = hotkey.Binding{}
+	u.hotkeyCaptureHasValue = false
+	u.status = message
+}
+
+func (u *windowUI) applyHotkeyBinding(binding hotkey.Binding) {
+	if binding.Name == u.appConfig.Hotkey {
+		u.hotkeyCaptureMode = false
+		u.hotkeyCapturePressed = nil
+		u.hotkeyCaptureCandidate = hotkey.Binding{}
+		u.hotkeyCaptureHasValue = false
+		u.status = "단축키 유지: " + binding.Name
+		return
+	}
+	rebind := u.rebindHotkey
+	if rebind == nil && u.registrar != nil {
+		rebind = u.registrar.RebindCapture
+	}
+	if rebind != nil {
+		if err := rebind(binding, u.captureHotkey); err != nil {
+			u.status = "단축키 변경 실패: " + err.Error()
+			return
+		}
+	}
+	u.hotkeyCaptureMode = false
+	u.hotkeyCapturePressed = nil
+	u.hotkeyCaptureCandidate = hotkey.Binding{}
+	u.hotkeyCaptureHasValue = false
 	u.appConfig.Hotkey = binding.Name
-	u.saveConfigStatus("Hotkey changed: " + binding.Name)
+	u.saveConfigStatus("단축키 변경: " + binding.Name)
 }
 
 func (u *windowUI) saveConfigStatus(success string) {
-	if err := config.Save(u.appConfig); err != nil {
-		u.status = success + " (config save failed: " + err.Error() + ")"
+	save := u.saveConfig
+	if save == nil {
+		save = config.Save
+	}
+	if err := save(u.appConfig); err != nil {
+		u.status = success + " (설정 저장 실패: " + err.Error() + ")"
 		return
 	}
 	u.status = success
+}
+
+func hotkeyBindingFromKeyEvent(ke key.Event) (hotkey.Binding, bool) {
+	keyName := hotkeyCaptureKeyName(ke.Name)
+	if keyName == "" {
+		return hotkey.Binding{}, false
+	}
+	return hotkey.BindingFromNames(hotkeyCaptureModifierNames(ke.Modifiers), keyName)
+}
+
+func (u *windowUI) addHotkeyCaptureKey(name string) bool {
+	if name == "" {
+		return true
+	}
+	for _, pressed := range u.hotkeyCapturePressed {
+		if pressed == name {
+			return true
+		}
+	}
+	if len(u.hotkeyCapturePressed) >= maxHotkeyCaptureKeys {
+		return false
+	}
+	u.hotkeyCapturePressed = append(u.hotkeyCapturePressed, name)
+	return true
+}
+
+func (u *windowUI) removeHotkeyCaptureKey(name string) {
+	for i, pressed := range u.hotkeyCapturePressed {
+		if pressed == name {
+			u.hotkeyCapturePressed = append(u.hotkeyCapturePressed[:i], u.hotkeyCapturePressed[i+1:]...)
+			return
+		}
+	}
+}
+
+func (u *windowUI) updateHotkeyCapturePreview() {
+	if binding, ok := bindingFromCapturedKeys(u.hotkeyCapturePressed); ok {
+		u.hotkeyCaptureCandidate = binding
+		u.hotkeyCaptureHasValue = true
+		u.status = "단축키 입력 중: " + binding.Name
+		return
+	}
+	if combo := strings.Join(u.hotkeyCapturePressed, "+"); combo != "" {
+		u.status = "단축키 입력 중: " + combo
+		return
+	}
+	u.status = "새 단축키를 눌러주세요. Esc로 취소할 수 있습니다."
+}
+
+func (u *windowUI) syncNativeHotkeyCaptureKeys(keys []string) {
+	current := make(map[string]bool, len(keys))
+	changed := false
+	for _, name := range keys {
+		if !isNativeHotkeyCaptureKey(name) {
+			continue
+		}
+		current[name] = true
+		if !u.addHotkeyCaptureKey(name) {
+			u.status = fmt.Sprintf("단축키는 최대 %d개 키까지 입력할 수 있습니다.", maxHotkeyCaptureKeys)
+			return
+		}
+		changed = true
+	}
+	for _, name := range nativeHotkeyCaptureKeys() {
+		if !current[name] && u.hotkeyCaptureKeyPressed(name) {
+			u.removeHotkeyCaptureKey(name)
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	if len(u.hotkeyCapturePressed) == 0 {
+		if u.hotkeyCaptureHasValue {
+			u.applyHotkeyBinding(u.hotkeyCaptureCandidate)
+			return
+		}
+		u.status = "Ctrl/Alt/Shift와 함께 사용할 키를 눌러주세요. Esc로 취소할 수 있습니다."
+		return
+	}
+	u.updateHotkeyCapturePreview()
+}
+
+func (u *windowUI) hotkeyCaptureKeyPressed(name string) bool {
+	for _, pressed := range u.hotkeyCapturePressed {
+		if pressed == name {
+			return true
+		}
+	}
+	return false
+}
+
+func nativeHotkeyCaptureKeys() []string {
+	return []string{"Ctrl", "Alt", "Shift", "PrintScreen", "Insert", "Pause", "Backspace"}
+}
+
+func isNativeHotkeyCaptureKey(name string) bool {
+	for _, keyName := range nativeHotkeyCaptureKeys() {
+		if name == keyName {
+			return true
+		}
+	}
+	return false
+}
+
+func bindingFromCapturedKeys(keys []string) (hotkey.Binding, bool) {
+	modifiers := make([]string, 0, len(keys))
+	var keyName string
+	for _, name := range keys {
+		if isHotkeyModifierName(name) {
+			modifiers = append(modifiers, name)
+			continue
+		}
+		if keyName != "" {
+			return hotkey.Binding{}, false
+		}
+		keyName = name
+	}
+	if keyName == "" {
+		return hotkey.Binding{}, false
+	}
+	return hotkey.BindingFromNames(modifiers, keyName)
+}
+
+func isHotkeyModifierName(name string) bool {
+	switch name {
+	case "Ctrl", "Alt", "Shift":
+		return true
+	default:
+		return false
+	}
+}
+
+func hotkeyCaptureEventKeyName(name key.Name) string {
+	switch name {
+	case key.NameCtrl:
+		return "Ctrl"
+	case key.NameShift:
+		return "Shift"
+	case key.NameAlt:
+		return "Alt"
+	case key.NameSuper, key.NameCommand:
+		return ""
+	default:
+		return hotkeyCaptureKeyName(name)
+	}
+}
+
+func hotkeyCaptureModifierNames(modifiers key.Modifiers) []string {
+	names := make([]string, 0, 4)
+	if modifiers.Contain(key.ModCtrl) {
+		names = append(names, "Ctrl")
+	}
+	if modifiers.Contain(key.ModAlt) {
+		names = append(names, "Alt")
+	}
+	if modifiers.Contain(key.ModShift) {
+		names = append(names, "Shift")
+	}
+	return names
+}
+
+func hotkeyCaptureKeyName(name key.Name) string {
+	switch name {
+	case key.NameCtrl, key.NameShift, key.NameAlt, key.NameSuper, key.NameCommand:
+		return ""
+	case key.NameSpace:
+		return "Space"
+	case key.NameReturn, key.NameEnter:
+		return "Enter"
+	case key.NameEscape:
+		return "Escape"
+	case key.NameHome:
+		return "Home"
+	case key.NameEnd:
+		return "End"
+	case key.NamePageUp:
+		return "PageUp"
+	case key.NamePageDown:
+		return "PageDown"
+	case key.NameDeleteBackward:
+		return "Backspace"
+	case key.NameDeleteForward:
+		return "Delete"
+	case key.NameTab:
+		return "Tab"
+	case key.NameLeftArrow:
+		return "Left"
+	case key.NameRightArrow:
+		return "Right"
+	case key.NameUpArrow:
+		return "Up"
+	case key.NameDownArrow:
+		return "Down"
+	default:
+		return strings.TrimSpace(string(name))
+	}
+}
+
+func allShortcutModifiers() key.Modifiers {
+	return key.ModCtrl | key.ModAlt | key.ModShift | key.ModSuper | key.ModCommand
 }
 
 func (u *windowUI) handleCanvasPointer(gtx layout.Context, w *app.Window, bounds, canvasBounds image.Rectangle, viewport coords.Viewport) {
@@ -1714,6 +2268,15 @@ func (u *windowUI) handleCanvasPointer(gtx layout.Context, w *app.Window, bounds
 			u.cropHoverHandle = u.hitCropHandle(point, cropRect, viewport.Scale)
 			w.Invalidate()
 		case pointer.Press:
+			if u.controller.Mode == workflow.ModeEditing && isCanvasPanButton(pe.Buttons) {
+				u.canvasPanning = true
+				u.canvasPanLast = point
+				u.dragging = false
+				u.cropDragging = false
+				u.status = "캔버스를 이동합니다."
+				w.Invalidate()
+				continue
+			}
 			if u.controller.Mode == workflow.ModeEditing {
 				handle := u.hitCropHandle(point, cropRect, viewport.Scale)
 				if handle != cropHandleNone {
@@ -1722,7 +2285,7 @@ func (u *windowUI) handleCanvasPointer(gtx layout.Context, w *app.Window, bounds
 					u.cropStartRect = cropRect
 					u.cropPreviewRect = cropRect
 					u.dragging = false
-					u.status = "Drag image border to crop."
+					u.status = "이미지 테두리를 드래그해 자르세요."
 					w.Invalidate()
 					continue
 				}
@@ -1732,6 +2295,12 @@ func (u *windowUI) handleCanvasPointer(gtx layout.Context, w *app.Window, bounds
 			u.dragNow = point
 			u.penPoints = []editor.Point{point}
 		case pointer.Drag:
+			if u.canvasPanning {
+				u.panCanvasBySourceDelta(u.canvasPanLast, point, canvasBounds, viewport)
+				u.canvasPanLast = point
+				w.Invalidate()
+				continue
+			}
 			if u.cropDragging {
 				u.updateCropPreview(point, bounds)
 				w.Invalidate()
@@ -1746,6 +2315,11 @@ func (u *windowUI) handleCanvasPointer(gtx layout.Context, w *app.Window, bounds
 			}
 			w.Invalidate()
 		case pointer.Release:
+			if u.canvasPanning {
+				u.canvasPanning = false
+				w.Invalidate()
+				continue
+			}
 			if u.cropDragging {
 				u.updateCropPreview(point, bounds)
 				u.commitCropPreview()
@@ -1763,13 +2337,14 @@ func (u *windowUI) handleCanvasPointer(gtx layout.Context, w *app.Window, bounds
 		case pointer.Cancel:
 			u.dragging = false
 			u.cropDragging = false
+			u.canvasPanning = false
 		}
 	}
 }
 
 func (u *windowUI) beginCapture(w *app.Window) {
 	if u.overlayActive || u.captureActive {
-		u.status = "Capture is already in progress."
+		u.status = "이미 캡처가 진행 중입니다."
 		return
 	}
 
@@ -1779,7 +2354,7 @@ func (u *windowUI) beginCapture(w *app.Window) {
 	u.autoCopyPending = false
 	u.captureActive = true
 	u.suppressFocusLossUntil = time.Now().Add(10 * time.Second)
-	u.status = "Capturing screen..."
+	u.status = "화면을 캡처하는 중..."
 	mode := u.appConfig.CaptureMode
 	go func() {
 		done := make(chan captureStartResult, 1)
@@ -1795,7 +2370,7 @@ func (u *windowUI) beginCapture(w *app.Window) {
 		case result := <-done:
 			u.captureResults <- result
 		case <-time.After(8 * time.Second):
-			u.captureResults <- captureStartResult{mode: mode, err: fmt.Errorf("screen capture timed out")}
+			u.captureResults <- captureStartResult{mode: mode, err: fmt.Errorf("화면 캡처 시간이 초과되었습니다")}
 		case <-u.ctx.Done():
 			return
 		}
@@ -1811,11 +2386,11 @@ func (u *windowUI) captureSnapshotExternal() (workflow.CaptureSnapshot, error) {
 func (u *windowUI) handleCaptureStartResult(result captureStartResult, w *app.Window) {
 	u.captureActive = false
 	if result.err != nil {
-		u.status = "Capture failed: " + result.err.Error()
+		u.status = "캡처 실패: " + result.err.Error()
 		return
 	}
 	if err := u.controller.BeginCaptureFromSnapshot(result.snapshot); err != nil {
-		u.status = "Capture failed: " + err.Error()
+		u.status = "캡처 실패: " + err.Error()
 		return
 	}
 
@@ -1824,37 +2399,36 @@ func (u *windowUI) handleCaptureStartResult(result captureStartResult, w *app.Wi
 	case "Fullscreen":
 		monitor := currentMonitorRect(u.controller.VirtualScreen, result.snapshot.Displays)
 		if err := u.controller.CommitScreenSelection(monitor); err != nil {
-			u.status = "Fullscreen capture failed: " + err.Error()
+			u.status = "전체화면 캡처 실패: " + err.Error()
 			return
 		}
 		u.resetCanvasView()
 		u.clearEditHistory()
 		u.restoreFromTray(w)
-		u.autoCopyPending = true
 		size := u.controller.OutputSize()
-		u.status = fmt.Sprintf("Editing monitor %dx%d capture.", size.X, size.Y)
+		u.finishCaptureReadyWithInitialCopy(fmt.Sprintf("%dx%d 모니터 캡처를 편집 중입니다.", size.X, size.Y))
 		u.autoSaveCurrentImage()
 		return
 	case "Freeform":
-		u.status = "Freeform mode: drag around the target area."
+		u.status = "자유형 모드: 대상 영역 둘레를 드래그하세요."
 	case "Window":
-		u.status = "Window mode: hover a window and click it."
+		u.status = "창 모드: 창 위에 마우스를 올리고 클릭하세요."
 		if len(result.windowTargets) == 0 {
-			u.status = "Window mode: no visible windows to select."
+			u.status = "창 모드: 선택할 수 있는 창이 없습니다."
 			u.controller.DiscardSelectionCapture()
 			u.restoreFromTray(w)
 			return
 		}
 	case "Scroll":
-		u.status = "Scroll mode: hover a scrollable window and click it."
+		u.status = "스크롤 모드: 창 안에서 드래그하세요. 아래/위 가장자리로 끌면 스크롤됩니다."
 		if len(result.windowTargets) == 0 {
-			u.status = "Scroll mode: no visible windows to select."
+			u.status = "스크롤 모드: 선택할 수 있는 창이 없습니다."
 			u.controller.DiscardSelectionCapture()
 			u.restoreFromTray(w)
 			return
 		}
 	default:
-		u.status = fmt.Sprintf("Drag a region in the overlay. Virtual screen: %v", u.controller.VirtualScreen)
+		u.status = fmt.Sprintf("오버레이에서 영역을 드래그하세요. 가상 화면: %v", u.controller.VirtualScreen)
 	}
 
 	u.overlayActive = true
@@ -1876,19 +2450,20 @@ func (u *windowUI) handleCaptureStartResult(result captureStartResult, w *app.Wi
 			if len(visibleRects) == 0 {
 				visibleRects = []image.Rectangle{target.Rect}
 			}
-			windowRegions = append(windowRegions, overlay.WindowRegion{Rect: target.Rect, VisibleRects: visibleRects})
+			windowRegions = append(windowRegions, overlay.WindowRegion{Handle: target.Handle, Rect: target.Rect, VisibleRects: visibleRects})
 		}
 	} else {
 		u.windowTargets = nil
 	}
 	go func() {
 		selection, ok, err := nativeoverlay.SelectDetailed(u.ctx, img, overlay.Options{
-			VirtualScreen: virtualScreen,
-			TopMostHint:   true,
-			DimAlpha:      dimAlpha,
-			CaptureMode:   mode,
-			WindowRects:   windowRects,
-			WindowRegions: windowRegions,
+			VirtualScreen:  virtualScreen,
+			TopMostHint:    true,
+			DimAlpha:       dimAlpha,
+			CaptureMode:    mode,
+			WindowRects:    windowRects,
+			WindowRegions:  windowRegions,
+			LiveBackground: mode == "Scroll",
 		})
 		u.overlayResults <- overlayResult{mode: mode, selection: selection, ok: ok, err: err}
 		w.Invalidate()
@@ -1901,13 +2476,13 @@ func (u *windowUI) handleOverlayResult(result overlayResult, w *app.Window) {
 	u.overlayActive = false
 	u.dragging = false
 	if result.err != nil {
-		u.status = "Overlay error: " + result.err.Error()
+		u.status = "오버레이 오류: " + result.err.Error()
 		u.controller.DiscardSelectionCapture()
 		u.restoreFromTray(w)
 		return
 	}
 	if !result.ok {
-		u.status = "Selection canceled. You can start capture again anytime."
+		u.status = "선택을 취소했습니다. 언제든 다시 캡처할 수 있습니다."
 		u.controller.DiscardSelectionCapture()
 		u.restoreFromTray(w)
 		return
@@ -1917,7 +2492,7 @@ func (u *windowUI) handleOverlayResult(result overlayResult, w *app.Window) {
 		err = u.commitWindowSelection(result.selection.Rect)
 	} else if result.mode == "Scroll" {
 		u.controller.DiscardSelectionCapture()
-		u.startScrollCapture(result.selection.Rect, w)
+		u.startScrollCapture(result.selection, w)
 		return
 	} else if len(result.selection.Polygon) >= 3 {
 		err = u.controller.CommitFreeformSelection(result.selection.Rect, result.selection.Polygon)
@@ -1925,7 +2500,7 @@ func (u *windowUI) handleOverlayResult(result overlayResult, w *app.Window) {
 		err = u.controller.CommitImageSelection(result.selection.Rect)
 	}
 	if err != nil {
-		u.status = "Selection failed: " + err.Error()
+		u.status = "선택 실패: " + err.Error()
 		u.controller.DiscardSelectionCapture()
 		u.restoreFromTray(w)
 		return
@@ -1933,9 +2508,8 @@ func (u *windowUI) handleOverlayResult(result overlayResult, w *app.Window) {
 	u.resetCanvasView()
 	u.clearEditHistory()
 	u.restoreFromTray(w)
-	u.autoCopyPending = true
 	size := u.controller.OutputSize()
-	u.status = fmt.Sprintf("Editing %dx%d capture. Annotate, then Copy or Save.", size.X, size.Y)
+	u.finishCaptureReadyWithInitialCopy(fmt.Sprintf("%dx%d 캡처를 편집 중입니다.", size.X, size.Y))
 	u.autoSaveCurrentImage()
 }
 
@@ -1950,49 +2524,83 @@ func (u *windowUI) commitWindowSelection(imageRect image.Rectangle) error {
 	return u.controller.CommitScreenCapture(screenRect)
 }
 
-func (u *windowUI) startScrollCapture(imageRect image.Rectangle, w *app.Window) {
-	screenRect := imageRect.Add(u.controller.VirtualScreen.Min)
+func (u *windowUI) startScrollCapture(selection nativeoverlay.Selection, w *app.Window) {
+	screenRect := selection.Rect.Add(u.controller.VirtualScreen.Min)
 	target, ok := u.findWindowTarget(screenRect)
 	if !ok {
-		u.status = "Scroll target was not found."
-		u.showToastDetail("Scroll capture failed", u.status)
+		u.status = "스크롤 대상을 찾지 못했습니다."
+		u.showToastDetail("스크롤 캡처 실패", u.status)
 		u.restoreFromTray(w)
 		return
 	}
-	u.restoreFromTray(w)
 	u.captureActive = true
-	u.status = "Scrolling capture in progress..."
-	u.showToastDetail("Scroll capture", "Capturing scrollable content...")
+	u.status = "스크롤 캡처 진행 중..."
+	u.showToastDetail("스크롤 캡처", "스크롤 가능한 내용을 캡처하는 중...")
+	rangeRequest, hasRange := scrollCaptureRangeFromSelection(selection, u.controller.VirtualScreen.Min)
 	go func() {
-		img, err := platformwindows.CaptureScrollTarget(target)
-		u.scrollResults <- scrollCaptureResult{target: target, img: img, err: err}
+		var img image.Image
+		var err error
+		resultRect := image.Rectangle{}
+		if hasRange {
+			img, err = platformwindows.CaptureScrollRange(target, rangeRequest)
+			resultRect = image.Rectangle{Min: target.Rect.Min.Add(rangeRequest.Crop.Min), Max: target.Rect.Min.Add(rangeRequest.Crop.Max)}
+		} else {
+			img, err = platformwindows.CaptureScrollTarget(target)
+		}
+		u.scrollResults <- scrollCaptureResult{target: target, img: img, screenRect: resultRect, err: err}
 		w.Invalidate()
 	}()
 }
 
-func (u *windowUI) handleScrollCaptureResult(result scrollCaptureResult) {
+func scrollCaptureRangeFromSelection(selection nativeoverlay.Selection, virtualMin image.Point) (platformwindows.ScrollCaptureRange, bool) {
+	if selection.ScrollRange == nil || selection.ScrollRange.CropRect.Empty() || selection.ScrollRange.WindowRect.Empty() {
+		return platformwindows.ScrollCaptureRange{}, false
+	}
+	windowRect := selection.ScrollRange.WindowRect.Add(virtualMin)
+	cropRect := selection.ScrollRange.CropRect.Add(virtualMin)
+	viewRect := selection.ScrollRange.ViewRect.Add(virtualMin)
+	crop := image.Rectangle{
+		Min: image.Pt(cropRect.Min.X-windowRect.Min.X, cropRect.Min.Y-windowRect.Min.Y),
+		Max: image.Pt(cropRect.Max.X-windowRect.Min.X, cropRect.Max.Y-windowRect.Min.Y),
+	}.Canon()
+	view := image.Rectangle{
+		Min: image.Pt(viewRect.Min.X-windowRect.Min.X, viewRect.Min.Y-windowRect.Min.Y),
+		Max: image.Pt(viewRect.Max.X-windowRect.Min.X, viewRect.Max.Y-windowRect.Min.Y),
+	}.Canon()
+	if crop.Empty() {
+		return platformwindows.ScrollCaptureRange{}, false
+	}
+	return platformwindows.ScrollCaptureRange{Crop: crop, View: view, ScrollSteps: selection.ScrollRange.ScrollSteps}, true
+}
+
+func (u *windowUI) handleScrollCaptureResult(result scrollCaptureResult, w *app.Window) {
 	u.captureActive = false
+	u.restoreFromTray(w)
 	if result.err != nil {
-		u.status = "Scroll capture failed: " + result.err.Error()
-		u.showToastDetail("Scroll capture failed", result.err.Error())
+		u.status = "스크롤 캡처 실패: " + result.err.Error()
+		u.showToastDetail("스크롤 캡처 실패", result.err.Error())
 		return
 	}
 	if result.img == nil || result.img.Bounds().Empty() {
-		u.status = "Scroll capture failed: empty image."
-		u.showToastDetail("Scroll capture failed", "Empty image")
+		u.status = "스크롤 캡처 실패: 빈 이미지입니다."
+		u.showToastDetail("스크롤 캡처 실패", "빈 이미지")
 		return
 	}
-	if err := u.controller.CommitExternalImage(scrollExternalRect(result.target, result.img), result.img); err != nil {
-		u.status = "Scroll capture failed: " + err.Error()
-		u.showToastDetail("Scroll capture failed", err.Error())
+	screenRect := result.screenRect
+	if screenRect.Empty() {
+		screenRect = scrollExternalRect(result.target, result.img)
+	} else {
+		screenRect.Max = screenRect.Min.Add(result.img.Bounds().Size())
+	}
+	if err := u.controller.CommitExternalImage(screenRect, result.img); err != nil {
+		u.status = "스크롤 캡처 실패: " + err.Error()
+		u.showToastDetail("스크롤 캡처 실패", err.Error())
 		return
 	}
 	u.resetCanvasView()
 	u.clearEditHistory()
-	u.autoCopyPending = true
 	size := u.controller.OutputSize()
-	u.status = fmt.Sprintf("Editing %dx%d scroll capture. Annotate, then Copy or Save.", size.X, size.Y)
-	u.showToastDetail("Scroll capture ready", fmt.Sprintf("%dx%d image captured", size.X, size.Y))
+	u.finishCaptureReadyWithInitialCopy(fmt.Sprintf("%dx%d 스크롤 캡처를 편집 중입니다. 휠 버튼 드래그로 이동하고 테두리로 범위를 자를 수 있습니다.", size.X, size.Y))
 	u.autoSaveCurrentImage()
 }
 
@@ -2025,12 +2633,11 @@ func (u *windowUI) commitGesture() {
 	case workflow.ModeSelecting:
 		selection := editor.NewRect(u.dragStart, u.dragNow).ImageRect()
 		if err := u.controller.CommitImageSelection(selection); err != nil {
-			u.status = "Selection failed: " + err.Error()
+			u.status = "선택 실패: " + err.Error()
 			return
 		}
-		u.autoCopyPending = true
 		size := u.controller.OutputSize()
-		u.status = fmt.Sprintf("Editing %dx%d capture. Annotate, then Copy or Save.", size.X, size.Y)
+		u.finishCaptureReadyWithInitialCopy(fmt.Sprintf("%dx%d 캡처를 편집 중입니다.", size.X, size.Y))
 		u.autoSaveCurrentImage()
 	case workflow.ModeEditing:
 		var err error
@@ -2047,22 +2654,22 @@ func (u *windowUI) commitGesture() {
 			err = u.controller.AddAnnotation(editor.ToolHighlight, u.penPoints, editor.Rect{})
 		}
 		if err != nil {
-			u.status = "Annotation failed: " + err.Error()
+			u.status = "주석 추가 실패: " + err.Error()
 			return
 		}
 		view := u.captureCanvasView()
 		u.recordControllerEdit(view, view)
 		if u.autoCopyPending {
 			u.autoCopyPending = false
-			if err := u.controller.CopyPNG(); err != nil {
-				u.status = fmt.Sprintf("%s annotation added. Auto-copy failed: %s", u.activeTool, err.Error())
-				u.showToast("Auto-copy failed")
+			if err := u.copyPNGCurrentImage(); err != nil {
+				u.status = fmt.Sprintf("%s 주석을 추가했습니다. 자동 복사 실패: %s", toolLabel(u.activeTool), err.Error())
+				u.showToast("자동 복사 실패")
 			} else {
-				u.status = fmt.Sprintf("%s annotation added and copied to clipboard.", u.activeTool)
-				u.showToast("Copied after first annotation")
+				u.status = fmt.Sprintf("%s 주석을 추가하고 클립보드에 복사했습니다.", toolLabel(u.activeTool))
+				u.showToast("첫 주석 후 복사 완료")
 			}
 		} else {
-			u.status = fmt.Sprintf("%s annotation added.", u.activeTool)
+			u.status = fmt.Sprintf("%s 주석을 추가했습니다.", toolLabel(u.activeTool))
 		}
 	}
 }
