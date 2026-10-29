@@ -1,3 +1,31 @@
+# Build output and release packages
 build/
 dist/
+release/
+
+# Generated binaries and Windows resources (build.cmd regenerates them)
+*.exe
+*.syso
+*.obj
+*.pdb
+*.ilk
+*.test
+*.prof
+*.out
+coverage.*
+
+# Runtime settings written next to the executable (contain local paths)
+config.json
+
+# Local-only material: third-party reference checkouts and private notes
 _references/
+.local/
+
+# Editor and OS clutter
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+*.log
