@@ -16,12 +16,17 @@ type WindowTarget struct {
 }
 
 type ScrollCaptureRange struct {
-	Crop        image.Rectangle
-	View        image.Rectangle
-	ScrollSteps int
+	Crop                 image.Rectangle
+	View                 image.Rectangle
+	ScrollSteps          int
+	ScrollPixels         int
+	InitialScrollPercent *float64
+	InitialScrollPoint   image.Point
+	InitialWheelUnits    int
 }
 
 func HideWindowByTitle(string) error                        { return nil }
+func FlushDesktopComposition()                              {}
 func RestoreWindowByTitle(string) error                     { return nil }
 func ForegroundIsWindowTitle(string) bool                   { return true }
 func WindowVisibleByTitle(string) bool                      { return true }
@@ -33,8 +38,8 @@ func CaptureScrollTarget(WindowTarget) (image.Image, error) { return nil, nil }
 func CaptureScrollRange(WindowTarget, ScrollCaptureRange) (image.Image, error) {
 	return nil, nil
 }
-func CursorPosition() image.Point             { return image.Point{} }
-func PickFolder(string) (string, bool, error) { return "", false, nil }
+func CursorPosition() image.Point                     { return image.Point{} }
+func PickFolder(string, string) (string, bool, error) { return "", false, nil }
 
 func DefaultScreenshotDir() string {
 	home, err := os.UserHomeDir()

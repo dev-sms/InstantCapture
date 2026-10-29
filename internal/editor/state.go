@@ -63,7 +63,7 @@ func (e *Editor) StartEditing() error {
 
 func (e *Editor) SetActiveTool(tool Tool) error {
 	switch tool {
-	case ToolPen, ToolRectangle, ToolArrow, ToolLine, ToolHighlight:
+	case ToolPen, ToolRectangle, ToolTriangle, ToolCircle, ToolArrow, ToolLine, ToolHighlight, ToolMosaic, ToolText:
 		e.ActiveTool = tool
 		return nil
 	default:
@@ -71,12 +71,43 @@ func (e *Editor) SetActiveTool(tool Tool) error {
 	}
 }
 
+func (e *Editor) AnnotationByID(id string) (Annotation, bool) {
+	for _, annotation := range e.Annotations {
+		if annotation.ID == id {
+			return annotation, true
+		}
+	}
+	return Annotation{}, false
+}
+
+func (e *Editor) ReplaceAnnotation(annotation Annotation) bool {
+	for i := range e.Annotations {
+		if e.Annotations[i].ID == annotation.ID {
+			e.Annotations[i] = annotation
+			e.RedoStack = nil
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Editor) RemoveAnnotation(id string) bool {
+	for i := range e.Annotations {
+		if e.Annotations[i].ID == id {
+			e.Annotations = append(e.Annotations[:i], e.Annotations[i+1:]...)
+			e.RedoStack = nil
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Editor) AddAnnotation(annotation Annotation) error {
 	if e.State != StateEditing {
 		return fmt.Errorf("cannot add annotation while state is %s", e.State)
 	}
 
-	if annotation.Style.Width == 0 {
+	if annotation.Tool != ToolText && annotation.Style.Width == 0 {
 		annotation.Style = DefaultStrokeStyle()
 	}
 

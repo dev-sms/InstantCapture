@@ -30,9 +30,13 @@ type WindowTarget struct {
 }
 
 type ScrollCaptureRange struct {
-	Crop        image.Rectangle
-	View        image.Rectangle
-	ScrollSteps int
+	Crop                 image.Rectangle
+	View                 image.Rectangle
+	ScrollSteps          int
+	ScrollPixels         int
+	InitialScrollPercent *float64
+	InitialScrollPoint   image.Point
+	InitialWheelUnits    int
 }
 
 type windowRect struct {
@@ -70,6 +74,7 @@ var (
 
 	windowDwmapi                = syscall.NewLazyDLL("dwmapi.dll")
 	windowDwmGetWindowAttribute = windowDwmapi.NewProc("DwmGetWindowAttribute")
+	windowDwmFlush              = windowDwmapi.NewProc("DwmFlush")
 
 	windowHelperCache struct {
 		once sync.Once
@@ -85,6 +90,10 @@ func HideWindowByTitle(title string) error {
 	}
 	windowShowWindowAsync.Call(hwnd, uintptr(swHide))
 	return nil
+}
+
+func FlushDesktopComposition() {
+	windowDwmFlush.Call()
 }
 
 func RestoreWindowByTitle(title string) error {
@@ -314,9 +323,68 @@ func CaptureScrollTarget(target WindowTarget) (image.Image, error) {
 		"--method", "wgc",
 		"--timeout-ms", "2500",
 		"--max-frames", "8",
-		"--delay-ms", "250",
+		"--delay-ms", "100",
 		"--overlap-px", "96",
 	)
+}
+
+type ScrollPosition struct {
+	Percent    float64
+	WheelPoint image.Point
+}
+
+func QueryScrollPosition(target WindowTarget, wheelPoint image.Point) (ScrollPosition, error) {
+	result, err := runScrollPositionHelper(target, "query-scroll", wheelPoint)
+	if err != nil {
+		return ScrollPosition{}, err
+	}
+	return ScrollPosition{Percent: result.ScrollPercent, WheelPoint: wheelPoint}, nil
+}
+
+func RestoreScrollPosition(target WindowTarget, position ScrollPosition) error {
+	_, err := runScrollPositionHelper(target, "restore-scroll", position.WheelPoint,
+		"--scroll-percent", strconv.FormatFloat(position.Percent, 'f', 6, 64),
+	)
+	return err
+}
+
+func runScrollPositionHelper(target WindowTarget, command string, wheelPoint image.Point, extraArgs ...string) (windowHelperResult, error) {
+	helper, err := findWindowCaptureHelper()
+	if err != nil {
+		return windowHelperResult{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	args := []string{
+		command,
+		"--hwnd", fmt.Sprintf("0x%X", target.Handle),
+		"--json",
+		"--wheel-x", strconv.Itoa(wheelPoint.X),
+		"--wheel-y", strconv.Itoa(wheelPoint.Y),
+	}
+	args = append(args, extraArgs...)
+	cmd := exec.CommandContext(ctx, helper, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdout, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return windowHelperResult{}, fmt.Errorf("window helper timed out during %s", command)
+	}
+	if err != nil {
+		if message := helperFailureMessage(stdout); message != "" {
+			return windowHelperResult{}, fmt.Errorf("window helper failed: %s%s", message, helperStderr(stderr.String()))
+		}
+		return windowHelperResult{}, fmt.Errorf("window helper failed: %w%s", err, helperStderr(stderr.String()))
+	}
+	var result windowHelperResult
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return windowHelperResult{}, fmt.Errorf("parse window helper JSON: %w", err)
+	}
+	if !result.OK {
+		return windowHelperResult{}, fmt.Errorf("window helper failed: %s", result.Message)
+	}
+	return result, nil
 }
 
 func CaptureScrollRange(target WindowTarget, r ScrollCaptureRange) (image.Image, error) {
@@ -324,33 +392,57 @@ func CaptureScrollRange(target WindowTarget, r ScrollCaptureRange) (image.Image,
 	if crop.Empty() {
 		return nil, fmt.Errorf("scroll range crop is empty")
 	}
-	maxFrames := scrollRangeMaxFrames(crop, target.Rect.Dy())
-	rangeSteps := cappedScrollRangeSteps(r.ScrollSteps)
-	if rangeSteps > 0 {
-		maxFrames = rangeSteps + 2
-		if maxFrames > 32 {
-			maxFrames = 32
-		}
+	if r.ScrollSteps > 64 {
+		return nil, fmt.Errorf("scroll range exceeds 64 wheel steps")
 	}
+	rangeSteps := 0
+	maxFrames := 96
 	wheelPoint := scrollRangeWheelPoint(target, r)
-	return captureTargetWithHelper(target, "capture-scroll", 12*time.Second,
+	args := []string{
 		"--method", "wgc",
 		"--timeout-ms", "2500",
 		"--max-frames", strconv.Itoa(maxFrames),
-		"--delay-ms", "250",
+		"--delay-ms", "100",
 		"--overlap-px", "96",
 		"--crop-x", strconv.Itoa(crop.Min.X),
 		"--crop-y", strconv.Itoa(crop.Min.Y),
 		"--crop-w", strconv.Itoa(crop.Dx()),
 		"--crop-h", strconv.Itoa(crop.Dy()),
 		"--range-steps", strconv.Itoa(rangeSteps),
-		"--range-end-y", strconv.Itoa(nonNegative(r.View.Max.Y)),
+		"--range-distance-px", "0",
+		"--range-end-y", "0",
 		"--wheel-x", strconv.Itoa(wheelPoint.X),
 		"--wheel-y", strconv.Itoa(wheelPoint.Y),
-	)
+	}
+	if r.InitialScrollPercent != nil {
+		args = append(args, "--initial-scroll-percent", strconv.FormatFloat(*r.InitialScrollPercent, 'f', 6, 64))
+	}
+	return captureTargetWithHelper(target, "capture-scroll", scrollRangeCaptureTimeout(maxFrames, rangeSteps), args...)
+}
+
+func scrollRangeCaptureFrames(rangeSteps int, crop image.Rectangle, viewportHeight int) int {
+	if rangeSteps == 0 {
+		return 1
+	}
+	frames := rangeSteps + 4
+	if estimated := scrollRangeMaxFrames(crop, viewportHeight); estimated > frames {
+		frames = estimated
+	}
+	if frames > 96 {
+		return 96
+	}
+	return frames
+}
+
+func scrollRangeCaptureTimeout(maxFrames, rangeSteps int) time.Duration {
+	return 4*time.Second + time.Duration(maxFrames)*2750*time.Millisecond + time.Duration(rangeSteps)*200*time.Millisecond
 }
 
 func scrollRangeWheelPoint(target WindowTarget, r ScrollCaptureRange) image.Point {
+	localBounds := image.Rect(0, 0, target.Rect.Dx(), target.Rect.Dy())
+	if (r.InitialScrollPercent != nil || r.InitialWheelUnits > 0) && r.InitialScrollPoint.In(localBounds) {
+		return target.Rect.Min.Add(r.InitialScrollPoint)
+	}
 	view := r.View.Canon()
 	if view.Empty() {
 		view = r.Crop.Canon()
@@ -358,15 +450,28 @@ func scrollRangeWheelPoint(target WindowTarget, r ScrollCaptureRange) image.Poin
 	if view.Empty() {
 		return target.Rect.Min.Add(target.Rect.Size().Div(2))
 	}
-	return target.Rect.Min.Add(image.Pt(view.Min.X+view.Dx()/2, view.Min.Y+view.Dy()/2))
+	point := image.Pt(view.Min.X+view.Dx()/2, view.Min.Y+view.Dy()/2)
+	point.X = clampInt(point.X, localBounds.Min.X, localBounds.Max.X-1)
+	point.Y = clampInt(point.Y, localBounds.Min.Y, localBounds.Max.Y-1)
+	return target.Rect.Min.Add(point)
+}
+
+func clampInt(value, minimum, maximum int) int {
+	if value < minimum {
+		return minimum
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
 }
 
 func cappedScrollRangeSteps(v int) int {
 	if v < 0 {
 		return 0
 	}
-	if v > 31 {
-		return 31
+	if v > 64 {
+		return 64
 	}
 	return v
 }
@@ -390,8 +495,8 @@ func scrollRangeMaxFrames(crop image.Rectangle, viewportHeight int) int {
 	if frames < 2 {
 		return 2
 	}
-	if frames > 32 {
-		return 32
+	if frames > 96 {
+		return 96
 	}
 	return frames
 }
@@ -427,13 +532,13 @@ func captureTargetWithHelper(target WindowTarget, command string, timeout time.D
 	cmd.Stderr = &stderr
 	stdout, err := cmd.Output()
 	if ctx.Err() == context.DeadlineExceeded {
-		return nil, fmt.Errorf("window helper timed out during %s", command)
+		return nil, fmt.Errorf("window helper timed out during %s (%s)", command, helper)
 	}
 	if err != nil {
 		if message := helperFailureMessage(stdout); message != "" {
-			return nil, fmt.Errorf("window helper capture failed: %s%s", message, helperStderr(stderr.String()))
+			return nil, fmt.Errorf("window helper capture failed (%s): %s%s", helper, message, helperStderr(stderr.String()))
 		}
-		return nil, fmt.Errorf("window helper failed: %w%s", err, helperStderr(stderr.String()))
+		return nil, fmt.Errorf("window helper failed (%s): %w%s", helper, err, helperStderr(stderr.String()))
 	}
 
 	var result windowHelperResult
@@ -445,7 +550,7 @@ func captureTargetWithHelper(target WindowTarget, command string, timeout time.D
 		if message == "" {
 			message = result.ErrorCode
 		}
-		return nil, fmt.Errorf("window helper capture failed: %s", message)
+		return nil, fmt.Errorf("window helper capture failed (%s): %s", helper, message)
 	}
 
 	file, err := os.Open(outPath)
@@ -464,13 +569,14 @@ func captureTargetWithHelper(target WindowTarget, command string, timeout time.D
 }
 
 type windowHelperResult struct {
-	OK         bool   `json:"ok"`
-	Method     string `json:"method"`
-	OutputPath string `json:"outputPath"`
-	Width      int    `json:"width"`
-	Height     int    `json:"height"`
-	ErrorCode  string `json:"errorCode"`
-	Message    string `json:"message"`
+	OK            bool    `json:"ok"`
+	Method        string  `json:"method"`
+	OutputPath    string  `json:"outputPath"`
+	Width         int     `json:"width"`
+	Height        int     `json:"height"`
+	ErrorCode     string  `json:"errorCode"`
+	Message       string  `json:"message"`
+	ScrollPercent float64 `json:"scrollPercent"`
 }
 
 func findWindowCaptureHelper() (string, error) {

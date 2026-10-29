@@ -1,6 +1,9 @@
 package editor
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestEditorSelectionFlow(t *testing.T) {
 	ed := NewEditor()
@@ -72,6 +75,35 @@ func TestArrowRenderCommandPreservesDirection(t *testing.T) {
 	}
 }
 
+func TestShapeAnnotationsNormalizeRenderRect(t *testing.T) {
+	for _, tool := range []Tool{ToolRectangle, ToolTriangle, ToolCircle} {
+		annotation := Annotation{
+			ID:    string(tool),
+			Tool:  tool,
+			Rect:  Rect{Min: Point{X: 40, Y: 30}, Max: Point{X: 10, Y: 5}},
+			Style: DefaultStrokeStyle(),
+		}
+		if err := annotation.Validate(); err != nil {
+			t.Fatalf("%s annotation was rejected: %v", tool, err)
+		}
+		if got, want := annotation.RenderCommand().Rect, annotation.Rect.Normalize(); got != want {
+			t.Fatalf("%s render rect = %#v, want %#v", tool, got, want)
+		}
+	}
+}
+
+func TestEditorAcceptsShapeTools(t *testing.T) {
+	ed := NewEditor()
+	for _, tool := range []Tool{ToolRectangle, ToolTriangle, ToolCircle} {
+		if err := ed.SetActiveTool(tool); err != nil {
+			t.Fatalf("SetActiveTool(%s): %v", tool, err)
+		}
+		if ed.ActiveTool != tool {
+			t.Fatalf("active tool = %s, want %s", ed.ActiveTool, tool)
+		}
+	}
+}
+
 func TestEditorUndoRedo(t *testing.T) {
 	ed := NewEditor()
 	ed.BeginSelection(Point{X: 0, Y: 0})
@@ -133,5 +165,243 @@ func TestEditorTranslateAnnotations(t *testing.T) {
 	}
 	if got := ed.RedoStack[0].Rect; got != (Rect{Min: Point{X: 47, Y: 53}, Max: Point{X: 67, Y: 73}}) {
 		t.Fatalf("unexpected translated redo rect: %#v", got)
+	}
+}
+
+func TestMosaicAnnotationRequiresBlockSize(t *testing.T) {
+	annotation := Annotation{
+		ID:     "mosaic-1",
+		Tool:   ToolMosaic,
+		Points: []Point{{X: 1, Y: 2}, {X: 10, Y: 12}},
+		Style:  StrokeStyle{Width: 20},
+	}
+	if err := annotation.Validate(); err == nil {
+		t.Fatal("mosaic without a block size should be rejected")
+	}
+	annotation.MosaicBlockSize = 8
+	if err := annotation.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := annotation.RenderCommand().MosaicBlockSize; got != 8 {
+		t.Fatalf("render command block size = %d, want 8", got)
+	}
+}
+
+func TestRectangleMosaicRequiresAndNormalizesRect(t *testing.T) {
+	annotation := Annotation{
+		ID:              "mosaic-rect",
+		Tool:            ToolMosaic,
+		Style:           StrokeStyle{Width: 20},
+		MosaicMode:      MosaicModeRectangle,
+		MosaicBlockSize: 8,
+	}
+	if err := annotation.Validate(); err == nil {
+		t.Fatal("rectangle mosaic without a rect should be rejected")
+	}
+	annotation.Rect = Rect{Min: Point{X: 20, Y: 18}, Max: Point{X: 4, Y: 3}}
+	if err := annotation.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	command := annotation.RenderCommand()
+	if command.MosaicMode != MosaicModeRectangle || command.Rect != annotation.Rect.Normalize() {
+		t.Fatalf("rectangle mosaic render command = %#v", command)
+	}
+}
+
+func TestRectanglePenRequiresAndNormalizesRect(t *testing.T) {
+	annotation := Annotation{
+		ID:      "pen-rect",
+		Tool:    ToolPen,
+		Style:   StrokeStyle{Width: 20},
+		PenMode: PenModeRectangle,
+	}
+	if err := annotation.Validate(); err == nil {
+		t.Fatal("rectangle pen without a rect should be rejected")
+	}
+	annotation.Rect = Rect{Min: Point{X: 20, Y: 18}, Max: Point{X: 4, Y: 3}}
+	if err := annotation.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	command := annotation.RenderCommand()
+	if command.PenMode != PenModeRectangle || command.Rect != annotation.Rect.Normalize() {
+		t.Fatalf("rectangle pen render command = %#v", command)
+	}
+}
+
+func TestTextAnnotationValidationAndRenderCommand(t *testing.T) {
+	style := DefaultTextStyle()
+	if style.FontFamily != TextFontMalgun {
+		t.Fatalf("default text font = %q, want %q", style.FontFamily, TextFontMalgun)
+	}
+	annotation := Annotation{
+		ID:        "text-1",
+		Tool:      ToolText,
+		Rect:      Rect{Min: Point{X: 80, Y: 60}, Max: Point{X: 10, Y: 20}},
+		Text:      "한글 English 123",
+		TextStyle: style,
+	}
+	if err := annotation.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	command := annotation.RenderCommand()
+	if command.Text != annotation.Text || command.TextStyle != style {
+		t.Fatalf("unexpected text render command: %#v", command)
+	}
+	if command.Rect != annotation.Rect.Normalize() {
+		t.Fatalf("text rect = %#v, want %#v", command.Rect, annotation.Rect.Normalize())
+	}
+	annotation.Text = ""
+	if err := annotation.Validate(); err == nil {
+		t.Fatal("empty text should be rejected")
+	}
+	annotation.Text = "text"
+	annotation.TextStyle.FontFamily = "unsupported"
+	if err := annotation.Validate(); err == nil {
+		t.Fatal("unsupported text font should be rejected")
+	}
+}
+
+func TestCanonicalizeTextRunsUsesRuneOffsetsAndBaseStyle(t *testing.T) {
+	text := "A한🙂B"
+	runs := []TextRun{
+		{Start: 0, End: 1, Bold: false},
+		{Start: 1, End: 2, Bold: true},
+		{Start: 2, End: 3, Bold: true},
+		{Start: 3, End: 4, Bold: false},
+	}
+	want := []TextRun{{Start: 0, End: 1, Bold: false}, {Start: 1, End: 3, Bold: true}, {Start: 3, End: 4, Bold: false}}
+	if got := CanonicalizeTextRuns(text, false, runs); !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonical runs = %#v, want %#v", got, want)
+	}
+	if got := CanonicalizeTextRuns(text, true, []TextRun{{Start: 0, End: 4, Bold: true}}); got != nil {
+		t.Fatalf("uniform base-style runs = %#v, want nil", got)
+	}
+	if !BoldAtRuneOffset(text, false, runs, 2) || BoldAtRuneOffset(text, false, runs, 3) {
+		t.Fatal("bold query did not use rune offsets")
+	}
+}
+
+func TestEffectiveRichTextFontFamilyUsesConsistentBoldFamily(t *testing.T) {
+	style := DefaultTextStyle()
+	style.FontFamily = TextFontGulim
+	if got := EffectiveRichTextFontFamily(style, nil); got != TextFontGulim {
+		t.Fatalf("regular family = %q, want %q", got, TextFontGulim)
+	}
+	if got := EffectiveRichTextFontFamily(style, []TextRun{{Start: 0, End: 1, Bold: true}}); got != TextFontMalgun {
+		t.Fatalf("mixed bold family = %q, want %q", got, TextFontMalgun)
+	}
+	style.Bold = true
+	if got := EffectiveRichTextFontFamily(style, []TextRun{{Start: 0, End: 1, Bold: false}}); got != TextFontGulim {
+		t.Fatalf("explicit regular family = %q, want %q", got, TextFontGulim)
+	}
+}
+
+func TestToggleBoldTextRunsNormalizesMixedSelection(t *testing.T) {
+	text := "가나다라"
+	runs := []TextRun{{Start: 0, End: 2, Bold: true}, {Start: 2, End: 4, Bold: false}}
+	want := []TextRun{{Start: 0, End: 3, Bold: true}, {Start: 3, End: 4, Bold: false}}
+	if got := ToggleBoldTextRuns(text, false, runs, 3, 1); !reflect.DeepEqual(got, want) {
+		t.Fatalf("mixed toggle = %#v, want %#v", got, want)
+	}
+
+	want = []TextRun{{Start: 0, End: 1, Bold: true}, {Start: 1, End: 3, Bold: false}, {Start: 3, End: 4, Bold: true}}
+	if got := ToggleBoldTextRuns(text, true, nil, 1, 3); !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy bold toggle = %#v, want %#v", got, want)
+	}
+}
+
+func TestTransformTextRunsForUnicodeReplacement(t *testing.T) {
+	runs := []TextRun{{Start: 0, End: 1, Bold: false}, {Start: 1, End: 3, Bold: true}}
+	want := []TextRun{{Start: 0, End: 1, Bold: false}, {Start: 1, End: 5, Bold: true}}
+	if got := TransformTextRuns("가🙂Z", "가🙂한글Z", false, runs); !reflect.DeepEqual(got, want) {
+		t.Fatalf("insert transform = %#v, want %#v", got, want)
+	}
+
+	runs = []TextRun{{Start: 0, End: 1, Bold: true}, {Start: 1, End: 4, Bold: false}}
+	want = []TextRun{{Start: 0, End: 1, Bold: true}, {Start: 1, End: 2, Bold: false}}
+	if got := TransformTextRuns("A한🙂B", "A界", false, runs); !reflect.DeepEqual(got, want) {
+		t.Fatalf("replacement transform = %#v, want %#v", got, want)
+	}
+
+	runs = []TextRun{{Start: 0, End: 1, Bold: true}, {Start: 1, End: 2, Bold: false}}
+	want = []TextRun{{Start: 0, End: 2, Bold: true}, {Start: 2, End: 3, Bold: false}}
+	if got := TransformTextRuns("ab", "a界b", false, runs); !reflect.DeepEqual(got, want) {
+		t.Fatalf("caret insertion transform = %#v, want %#v", got, want)
+	}
+}
+
+func TestTransformTextRunsForEditDisambiguatesRepeatedRuneDeletion(t *testing.T) {
+	runs := []TextRun{{Start: 0, End: 1, Bold: true}, {Start: 1, End: 2, Bold: false}}
+	got := TransformTextRunsForEdit("aa", "a", false, runs, 0, 0, 0)
+	if got != nil {
+		t.Fatalf("deleting the first bold rune transferred its style to the surviving regular rune: %#v", got)
+	}
+	got = TransformTextRunsForEdit("aa", "a", false, runs, 2, 2, 1)
+	if len(got) != 1 || !got[0].Bold || got[0].Start != 0 || got[0].End != 1 {
+		t.Fatalf("backspace should preserve the surviving bold rune: %#v", got)
+	}
+}
+
+func TestTransformTextRunsForEditPreservesReplacedSelectionStyle(t *testing.T) {
+	runs := []TextRun{{Start: 0, End: 1, Bold: false}, {Start: 1, End: 2, Bold: true}}
+	got := TransformTextRunsForEdit("aB", "a한", false, runs, 1, 2, 2)
+	want := []TextRun{{Start: 0, End: 1, Bold: false}, {Start: 1, End: 2, Bold: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("replacement runs = %#v, want %#v", got, want)
+	}
+}
+
+func TestTransformTextRunsForEditPreservesStyleAcrossIMECompositionReplacement(t *testing.T) {
+	runs := []TextRun{{Start: 0, End: 1, Bold: true}, {Start: 1, End: 2, Bold: false}}
+	firstComposed := TransformTextRunsForEdit("가나", "각나", false, runs, 2, 2, 1)
+	if !BoldAtRuneOffset("각나", false, firstComposed, 0) || BoldAtRuneOffset("각나", false, firstComposed, 1) {
+		t.Fatalf("first composition replacement changed styles: %#v", firstComposed)
+	}
+	secondComposed := TransformTextRunsForEdit("가나", "가날", false, runs, 0, 0, 2)
+	if !BoldAtRuneOffset("가날", false, secondComposed, 0) || BoldAtRuneOffset("가날", false, secondComposed, 1) {
+		t.Fatalf("second composition replacement changed styles: %#v", secondComposed)
+	}
+}
+
+func TestTextRunValidationRejectsMalformedExplicitRuns(t *testing.T) {
+	base := Annotation{
+		ID:        "text-runs",
+		Tool:      ToolText,
+		Rect:      NewRect(Point{}, Point{X: 100, Y: 40}),
+		Text:      "한글A",
+		TextStyle: DefaultTextStyle(),
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("legacy nil runs rejected: %v", err)
+	}
+	malformed := [][]TextRun{
+		{},
+		{{Start: 1, End: 3}},
+		{{Start: 0, End: 2}, {Start: 1, End: 3, Bold: true}},
+		{{Start: 0, End: 4}},
+		{{Start: 0, End: 1}, {Start: 1, End: 3}},
+	}
+	for _, runs := range malformed {
+		annotation := base
+		annotation.TextRuns = runs
+		if err := annotation.Validate(); err == nil {
+			t.Fatalf("malformed runs accepted: %#v", runs)
+		}
+	}
+}
+
+func TestRenderCommandDeepCopiesTextRuns(t *testing.T) {
+	annotation := Annotation{
+		ID:        "text-copy",
+		Tool:      ToolText,
+		Rect:      NewRect(Point{}, Point{X: 100, Y: 40}),
+		Text:      "ab",
+		TextStyle: DefaultTextStyle(),
+		TextRuns:  []TextRun{{Start: 0, End: 1, Bold: true}, {Start: 1, End: 2, Bold: false}},
+	}
+	command := annotation.RenderCommand()
+	command.TextRuns[0].Bold = false
+	if !annotation.TextRuns[0].Bold {
+		t.Fatal("render command shares text runs with annotation")
 	}
 }

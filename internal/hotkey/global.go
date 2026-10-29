@@ -228,7 +228,7 @@ func keyFromName(name string) (designhotkey.Key, string, bool) {
 	}
 	if strings.HasPrefix(upper, "F") && len(upper) > 1 {
 		var number int
-		if _, err := fmt.Sscanf(upper, "F%d", &number); err == nil && number >= 1 && number <= 20 {
+		if _, err := fmt.Sscanf(upper, "F%d", &number); err == nil && fmt.Sprintf("F%d", number) == upper && number >= 1 && number <= 20 {
 			return designhotkey.Key(0x6F + number), fmt.Sprintf("F%d", number), true
 		}
 	}

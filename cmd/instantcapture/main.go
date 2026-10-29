@@ -27,11 +27,11 @@ func main() {
 		fmt.Println(version)
 		return
 	}
+	if err := app.SmokeCheck(); err != nil {
+		log.Fatal(err)
+	}
 
 	if *smoke {
-		if err := app.SmokeCheck(); err != nil {
-			log.Fatal(err)
-		}
 		fmt.Println("InstantCapture smoke check passed")
 		return
 	}
@@ -52,7 +52,18 @@ func main() {
 		return
 	}
 
+	releaseInstance, alreadyRunning, err := app.AcquireSingleInstance()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if alreadyRunning {
+		app.ActivateExistingInstance()
+		return
+	}
+	defer releaseInstance()
+
 	go func() {
+		defer releaseInstance()
 		if err := app.Run(context.Background()); err != nil {
 			log.Print(err)
 			os.Exit(1)

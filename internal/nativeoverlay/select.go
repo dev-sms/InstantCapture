@@ -17,10 +17,14 @@ type Selection struct {
 }
 
 type ScrollRangeSelection struct {
-	WindowRect  image.Rectangle
-	CropRect    image.Rectangle
-	ViewRect    image.Rectangle
-	ScrollSteps int
+	WindowRect           image.Rectangle
+	CropRect             image.Rectangle
+	ViewRect             image.Rectangle
+	ScrollSteps          int
+	ScrollPixels         int
+	InitialScrollPercent *float64
+	InitialScrollPoint   image.Point
+	InitialWheelUnits    int
 }
 
 func Select(ctx context.Context, img image.Image, options ...overlay.Options) (image.Rectangle, bool, error) {

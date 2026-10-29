@@ -3,9 +3,11 @@ package workflow
 import (
 	"fmt"
 	"image"
+	"image/color"
 	"image/draw"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"instantcapture/internal/capture"
@@ -23,6 +25,10 @@ const (
 
 const MaxEditHistoryEntries = 20
 
+type RenderOptions struct {
+	OutputBorder exporter.BorderOptions
+}
+
 type CaptureSnapshot struct {
 	VirtualScreen image.Rectangle
 	Displays      []image.Rectangle
@@ -34,6 +40,9 @@ type Controller struct {
 	Editor           *editor.Editor
 	AnnotationStyle  editor.StrokeStyle
 	HighlighterStyle editor.StrokeStyle
+	MosaicStyle      editor.StrokeStyle
+	MosaicBlockSize  int
+	RenderOptions    RenderOptions
 
 	Mode              Mode
 	VirtualScreen     image.Rectangle
@@ -47,6 +56,8 @@ type Controller struct {
 	nextAnnotationID int
 	undoStack        []editSnapshot
 	redoStack        []editSnapshot
+	previewImage     *image.RGBA
+	previewRevision  uint64
 }
 
 type editSnapshot struct {
@@ -65,6 +76,8 @@ func NewController(capturer capture.ScreenCapturer) *Controller {
 		Editor:           editor.NewEditor(),
 		AnnotationStyle:  editor.DefaultStrokeStyle(),
 		HighlighterStyle: editor.StrokeStyle{ColorRGBA: [4]uint8{250, 204, 21, 180}, Width: 14},
+		MosaicStyle:      editor.StrokeStyle{Width: 24},
+		MosaicBlockSize:  12,
 		Mode:             ModeIdle,
 	}
 }
@@ -129,6 +142,7 @@ func (c *Controller) BeginCaptureFromSnapshot(snapshot CaptureSnapshot) error {
 	c.SelectedScreen = image.Rectangle{}
 	c.Editor = editor.NewEditor()
 	c.clearEditHistory()
+	c.invalidatePreviewImage()
 	c.Mode = ModeSelecting
 	return nil
 }
@@ -146,8 +160,13 @@ func (c *Controller) CommitImageSelection(selection image.Rectangle) error {
 		return fmt.Errorf("selection is empty")
 	}
 
-	c.CapturedImage = cropImage(c.FullScreenImage, selection)
+	if selection.Eq(c.FullScreenImage.Bounds()) {
+		c.CapturedImage = normalizeImage(c.FullScreenImage)
+	} else {
+		c.CapturedImage = cropImage(c.FullScreenImage, selection)
+	}
 	c.ReleaseFullScreenImage()
+	c.invalidatePreviewImage()
 	c.CapturedImageRect = image.Rectangle{Min: selection.Min, Max: selection.Min.Add(c.CapturedImage.Bounds().Size())}
 	c.CropRect = image.Rectangle{Max: c.CapturedImage.Bounds().Size()}
 	c.updateSelectedRectsFromCrop()
@@ -183,6 +202,7 @@ func (c *Controller) CommitFreeformSelection(selection image.Rectangle, polygon 
 		local = append(local, p.Sub(selection.Min))
 	}
 	applyPolygonAlphaMask(rgba, local)
+	c.invalidatePreviewImage()
 	return nil
 }
 
@@ -221,6 +241,7 @@ func (c *Controller) CommitFreeformScreenCapture(selection image.Rectangle, poly
 			local = append(local, p.Sub(selection.Min))
 		}
 		applyPolygonAlphaMask(rgba, local)
+		c.invalidatePreviewImage()
 	}
 	return nil
 }
@@ -242,6 +263,7 @@ func (c *Controller) CommitExternalImage(screenRect image.Rectangle, img image.I
 	}
 	c.CapturedImage = normalizeImage(img)
 	c.ReleaseFullScreenImage()
+	c.invalidatePreviewImage()
 	screenMin := screenRect.Min
 	imageMin := screenMin.Sub(c.VirtualScreen.Min)
 	c.CapturedImageRect = image.Rectangle{Min: imageMin, Max: imageMin.Add(c.CapturedImage.Bounds().Size())}
@@ -263,13 +285,37 @@ func (c *Controller) CommitExternalImage(screenRect image.Rectangle, img image.I
 	return nil
 }
 
+func (c *Controller) CommitImportedImage(img image.Image) error {
+	if img == nil {
+		return fmt.Errorf("imported image is nil")
+	}
+	size := img.Bounds().Size()
+	if size.X <= 0 || size.Y <= 0 {
+		return fmt.Errorf("imported image is empty")
+	}
+	c.VirtualScreen = image.Rectangle{Max: size}
+	return c.CommitExternalImage(image.Rectangle{Max: size}, img)
+}
+
 func (c *Controller) AddAnnotation(tool editor.Tool, points []editor.Point, rect editor.Rect) error {
+	return c.addAnnotation(tool, points, rect, editor.PenModeStraight, editor.MosaicModeStraight)
+}
+
+func (c *Controller) AddPenAnnotation(mode editor.PenMode, points []editor.Point, rect editor.Rect) error {
+	return c.addAnnotation(editor.ToolPen, points, rect, mode, editor.MosaicModeStraight)
+}
+
+func (c *Controller) AddMosaicAnnotation(mode editor.MosaicMode, points []editor.Point, rect editor.Rect) error {
+	return c.addAnnotation(editor.ToolMosaic, points, rect, editor.PenModeStraight, mode)
+}
+
+func (c *Controller) addAnnotation(tool editor.Tool, points []editor.Point, rect editor.Rect, penMode editor.PenMode, mosaicMode editor.MosaicMode) error {
 	if c.Mode != ModeEditing {
 		return fmt.Errorf("cannot annotate while mode is %s", c.Mode)
 	}
 
 	nextID := c.nextAnnotationID + 1
-	if tool == editor.ToolRectangle {
+	if tool == editor.ToolRectangle || tool == editor.ToolTriangle || tool == editor.ToolCircle || (tool == editor.ToolPen && penMode == editor.PenModeRectangle) || (tool == editor.ToolMosaic && mosaicMode == editor.MosaicModeRectangle) {
 		rect = rect.Normalize()
 	}
 
@@ -280,6 +326,13 @@ func (c *Controller) AddAnnotation(tool editor.Tool, points []editor.Point, rect
 		Rect:   rect,
 		Style:  c.styleForTool(tool),
 	}
+	if tool == editor.ToolPen {
+		annotation.PenMode = penMode
+	}
+	if tool == editor.ToolMosaic {
+		annotation.MosaicMode = mosaicMode
+		annotation.MosaicBlockSize = c.MosaicBlockSize
+	}
 	if annotation.Style.Width == 0 {
 		annotation.Style = editor.DefaultStrokeStyle()
 	}
@@ -288,7 +341,102 @@ func (c *Controller) AddAnnotation(tool editor.Tool, points []editor.Point, rect
 	}
 	c.pushEditHistory()
 	c.nextAnnotationID = nextID
-	return c.Editor.AddAnnotation(annotation)
+	if err := c.Editor.AddAnnotation(annotation); err != nil {
+		return err
+	}
+	c.invalidatePreviewImage()
+	return nil
+}
+
+func (c *Controller) AddTextAnnotation(text string, rect editor.Rect, style editor.TextStyle) (string, error) {
+	return c.AddRichTextAnnotation(text, nil, rect, style)
+}
+
+func (c *Controller) AddRichTextAnnotation(text string, runs []editor.TextRun, rect editor.Rect, style editor.TextStyle) (string, error) {
+	if c.Mode != ModeEditing {
+		return "", fmt.Errorf("cannot annotate while mode is %s", c.Mode)
+	}
+	runs = editor.CanonicalizeTextRuns(text, style.Bold, runs)
+	nextID := c.nextAnnotationID + 1
+	annotation := editor.Annotation{
+		ID:        fmt.Sprintf("annotation-%d", nextID),
+		Tool:      editor.ToolText,
+		Rect:      rect.Normalize(),
+		Text:      text,
+		TextStyle: style,
+		TextRuns:  append([]editor.TextRun(nil), runs...),
+	}
+	if err := annotation.Validate(); err != nil {
+		return "", err
+	}
+	c.pushEditHistory()
+	c.nextAnnotationID = nextID
+	if err := c.Editor.AddAnnotation(annotation); err != nil {
+		return "", err
+	}
+	c.invalidatePreviewImage()
+	return annotation.ID, nil
+}
+
+func (c *Controller) UpdateTextAnnotation(id, text string, rect editor.Rect, style editor.TextStyle) (bool, error) {
+	if c.Mode != ModeEditing {
+		return false, fmt.Errorf("cannot annotate while mode is %s", c.Mode)
+	}
+	current, ok := c.Editor.AnnotationByID(id)
+	if !ok || current.Tool != editor.ToolText {
+		return false, fmt.Errorf("text annotation %q was not found", id)
+	}
+	runs := current.TextRuns
+	if runs != nil {
+		runs = editor.TransformTextRuns(current.Text, text, current.TextStyle.Bold, runs)
+		if runs == nil && len([]rune(text)) > 0 && style.Bold != current.TextStyle.Bold {
+			runs = []editor.TextRun{{Start: 0, End: len([]rune(text)), Bold: current.TextStyle.Bold}}
+		}
+	}
+	return c.UpdateRichTextAnnotation(id, text, runs, rect, style)
+}
+
+func (c *Controller) UpdateRichTextAnnotation(id, text string, runs []editor.TextRun, rect editor.Rect, style editor.TextStyle) (bool, error) {
+	if c.Mode != ModeEditing {
+		return false, fmt.Errorf("cannot annotate while mode is %s", c.Mode)
+	}
+	current, ok := c.Editor.AnnotationByID(id)
+	if !ok || current.Tool != editor.ToolText {
+		return false, fmt.Errorf("text annotation %q was not found", id)
+	}
+	next := current
+	next.Text = text
+	next.Rect = rect.Normalize()
+	next.TextStyle = style
+	next.TextRuns = editor.CanonicalizeTextRuns(text, style.Bold, runs)
+	if err := next.Validate(); err != nil {
+		return false, err
+	}
+	if current.Text == next.Text && current.Rect == next.Rect && current.TextStyle == next.TextStyle && slices.Equal(current.TextRuns, next.TextRuns) {
+		return false, nil
+	}
+	c.pushEditHistory()
+	if !c.Editor.ReplaceAnnotation(next) {
+		return false, fmt.Errorf("text annotation %q was not found", id)
+	}
+	c.invalidatePreviewImage()
+	return true, nil
+}
+
+func (c *Controller) RemoveTextAnnotation(id string) (bool, error) {
+	if c.Mode != ModeEditing {
+		return false, fmt.Errorf("cannot annotate while mode is %s", c.Mode)
+	}
+	annotation, ok := c.Editor.AnnotationByID(id)
+	if !ok || annotation.Tool != editor.ToolText {
+		return false, nil
+	}
+	c.pushEditHistory()
+	removed := c.Editor.RemoveAnnotation(id)
+	if removed {
+		c.invalidatePreviewImage()
+	}
+	return removed, nil
 }
 
 func (c *Controller) UndoAnnotation() bool {
@@ -306,9 +454,11 @@ func (c *Controller) UndoEdit() bool {
 	}
 	current := c.snapshotEditState()
 	last := c.undoStack[len(c.undoStack)-1]
+	c.undoStack[len(c.undoStack)-1] = editSnapshot{}
 	c.undoStack = c.undoStack[:len(c.undoStack)-1]
 	c.redoStack = appendBoundedEditHistory(c.redoStack, current)
 	c.restoreEditState(last)
+	c.invalidatePreviewImage()
 	return true
 }
 
@@ -318,9 +468,11 @@ func (c *Controller) RedoEdit() bool {
 	}
 	current := c.snapshotEditState()
 	next := c.redoStack[len(c.redoStack)-1]
+	c.redoStack[len(c.redoStack)-1] = editSnapshot{}
 	c.redoStack = c.redoStack[:len(c.redoStack)-1]
 	c.undoStack = appendBoundedEditHistory(c.undoStack, current)
 	c.restoreEditState(next)
+	c.invalidatePreviewImage()
 	return true
 }
 
@@ -328,6 +480,8 @@ func (c *Controller) styleForTool(tool editor.Tool) editor.StrokeStyle {
 	style := c.AnnotationStyle
 	if tool == editor.ToolHighlight {
 		style = c.HighlighterStyle
+	} else if tool == editor.ToolMosaic {
+		style = c.MosaicStyle
 	} else {
 		style.ColorRGBA[3] = 255
 	}
@@ -338,14 +492,104 @@ func (c *Controller) RenderedImage() (*image.RGBA, error) {
 	if c.CapturedImage == nil {
 		return nil, fmt.Errorf("captured image is nil")
 	}
-	return exporter.RenderAnnotationsCropped(c.CapturedImage, c.Editor.RenderCommands(), c.VisibleCropRect())
+	return exporter.RenderAnnotationsCroppedWithBorder(c.CapturedImage, c.Editor.RenderCommands(), c.VisibleCropRect(), c.RenderOptions.OutputBorder)
+}
+
+func (c *Controller) OriginalImage() (*image.RGBA, error) {
+	if c.CapturedImage == nil {
+		return nil, fmt.Errorf("captured image is nil")
+	}
+	return exporter.RenderAnnotationsCropped(c.CapturedImage, nil, c.VisibleCropRect())
 }
 
 func (c *Controller) PreviewImage() (*image.RGBA, error) {
 	if c.CapturedImage == nil {
 		return nil, fmt.Errorf("captured image is nil")
 	}
-	return exporter.RenderAnnotations(c.CapturedImage, c.Editor.RenderCommands())
+	if c.previewImage != nil {
+		return c.previewImage, nil
+	}
+	if len(c.Editor.Annotations) == 0 {
+		if rgba, ok := c.CapturedImage.(*image.RGBA); ok {
+			c.previewImage = rgba
+			return rgba, nil
+		}
+	}
+	preview, err := exporter.RenderAnnotations(c.CapturedImage, c.Editor.RenderCommands())
+	if err != nil {
+		return nil, err
+	}
+	c.previewImage = preview
+	return preview, nil
+}
+
+func (c *Controller) invalidatePreviewImage() {
+	c.previewImage = nil
+	c.previewRevision++
+}
+
+func (c *Controller) PreviewRevision() uint64 {
+	return c.previewRevision
+}
+
+func (c *Controller) ReleasePreviewCache() {
+	if c.previewImage != nil {
+		c.invalidatePreviewImage()
+	}
+}
+
+func (c *Controller) PreviewImageWithPending(command editor.RenderCommand) (*image.RGBA, error) {
+	if c.CapturedImage == nil {
+		return nil, fmt.Errorf("captured image is nil")
+	}
+	commands := c.Editor.RenderCommands()
+	commands = append(commands, command)
+	return exporter.RenderAnnotations(c.CapturedImage, commands)
+}
+
+func (c *Controller) PreviewImageWithoutAnnotation(id string) (*image.RGBA, error) {
+	if c.CapturedImage == nil {
+		return nil, fmt.Errorf("captured image is nil")
+	}
+	commands := make([]editor.RenderCommand, 0, len(c.Editor.Annotations))
+	for _, annotation := range c.Editor.Annotations {
+		if annotation.ID != id {
+			commands = append(commands, annotation.RenderCommand())
+		}
+	}
+	return exporter.RenderAnnotations(c.CapturedImage, commands)
+}
+
+func (c *Controller) PreviewImageReplacingAnnotation(id string, pending editor.RenderCommand) (*image.RGBA, error) {
+	if c.CapturedImage == nil {
+		return nil, fmt.Errorf("captured image is nil")
+	}
+	commands := make([]editor.RenderCommand, 0, len(c.Editor.Annotations)+1)
+	pendingAdded := false
+	for _, annotation := range c.Editor.Annotations {
+		if annotation.ID == id {
+			if !pending.Rect.Empty() {
+				pending.TextRuns = append([]editor.TextRun(nil), pending.TextRuns...)
+				commands = append(commands, pending)
+				pendingAdded = true
+			}
+			continue
+		}
+		commands = append(commands, annotation.RenderCommand())
+	}
+	if !pendingAdded && !pending.Rect.Empty() {
+		pending.TextRuns = append([]editor.TextRun(nil), pending.TextRuns...)
+		commands = append(commands, pending)
+	}
+	return exporter.RenderAnnotations(c.CapturedImage, commands)
+}
+
+func (c *Controller) SetOutputBorder(enabled bool, width int, rgba [4]uint8) {
+	c.RenderOptions.OutputBorder = exporter.BorderOptions{
+		Enabled: enabled,
+		Width:   width,
+		Color:   color.NRGBA{R: rgba[0], G: rgba[1], B: rgba[2], A: rgba[3]},
+	}
 }
 
 func (c *Controller) CropCapturedImage(rect image.Rectangle) error {
@@ -416,6 +660,21 @@ func (c *Controller) DiscardSelectionCapture() {
 	}
 }
 
+func (c *Controller) ResetEditingSession() {
+	c.VirtualScreen = image.Rectangle{}
+	c.FullScreenImage = nil
+	c.CapturedImage = nil
+	c.CapturedImageRect = image.Rectangle{}
+	c.CropRect = image.Rectangle{}
+	c.SelectedImageRect = image.Rectangle{}
+	c.SelectedScreen = image.Rectangle{}
+	c.Editor = editor.NewEditor()
+	c.nextAnnotationID = 0
+	c.clearEditHistory()
+	c.invalidatePreviewImage()
+	c.Mode = ModeIdle
+}
+
 func (c *Controller) restoreEditState(snapshot editSnapshot) {
 	c.CapturedImage = snapshot.CapturedImage
 	c.CapturedImageRect = snapshot.CapturedImageRect
@@ -444,6 +703,7 @@ func cloneAnnotations(src []editor.Annotation) []editor.Annotation {
 	for i := range src {
 		dst[i] = src[i]
 		dst[i].Points = append([]editor.Point(nil), src[i].Points...)
+		dst[i].TextRuns = append([]editor.TextRun(nil), src[i].TextRuns...)
 	}
 	return dst
 }
@@ -507,6 +767,26 @@ func (c *Controller) SavePNG(dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return savePNG(dir, img)
+}
+
+func (c *Controller) SaveImage(path string) error {
+	img, err := c.RenderedImage()
+	if err != nil {
+		return err
+	}
+	return exporter.SaveImage(path, img)
+}
+
+func (c *Controller) SaveOriginalPNG(dir string) (string, error) {
+	img, err := c.OriginalImage()
+	if err != nil {
+		return "", err
+	}
+	return savePNG(dir, img)
+}
+
+func savePNG(dir string, img image.Image) (string, error) {
 	if dir == "" {
 		dir = "."
 	}
@@ -535,6 +815,9 @@ func nextSavePath(dir string, now time.Time) string {
 func normalizeImage(src image.Image) *image.RGBA {
 	if src == nil {
 		return nil
+	}
+	if rgba, ok := src.(*image.RGBA); ok && rgba.Bounds().Min == (image.Point{}) && rgba.Stride == rgba.Bounds().Dx()*4 && len(rgba.Pix) == rgba.Stride*rgba.Bounds().Dy() {
+		return rgba
 	}
 	return cropImage(src, src.Bounds())
 }

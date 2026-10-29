@@ -11,5 +11,6 @@ const (
 
 type Tray struct{}
 
-func Start(chan<- Event) (*Tray, error) { return &Tray{}, nil }
-func (t *Tray) Stop()                   {}
+func Start(chan<- Event) (*Tray, error)     { return &Tray{}, nil }
+func (t *Tray) Stop()                       {}
+func (t *Tray) Notify(string, string) error { return nil }

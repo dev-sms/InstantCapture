@@ -37,5 +37,5 @@ func PressedSpecialShortcutKeys() []string {
 
 func asyncKeyDown(vk int) bool {
 	state, _, _ := shortcutGetAsyncKeyState.Call(uintptr(vk))
-	return state&0x8000 != 0 || state&1 != 0
+	return state&0x8000 != 0
 }

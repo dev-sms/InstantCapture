@@ -29,6 +29,7 @@ const (
 	wmTrayCallback  = 0x8000 + 1
 
 	nimAdd        = 0x00000000
+	nimModify     = 0x00000001
 	nimDelete     = 0x00000002
 	nimSetVersion = 0x00000004
 	nifMessage    = 0x00000001
@@ -37,6 +38,7 @@ const (
 	nifInfo       = 0x00000010
 	nifShowTip    = 0x00000080
 	notifyVersion = 4
+	niifInfo      = 0x00000001
 
 	mfString       = 0x00000000
 	tmpRightButton = 0x0002
@@ -66,6 +68,8 @@ var (
 	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	procCreateIcon          = user32.NewProc("CreateIcon")
+	procLoadImageW          = user32.NewProc("LoadImageW")
+	procCopyIcon            = user32.NewProc("CopyIcon")
 	procDestroyIcon         = user32.NewProc("DestroyIcon")
 
 	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
@@ -161,6 +165,41 @@ func (t *Tray) Stop() {
 	}
 }
 
+func (t *Tray) Notify(title, message string) error {
+	if t == nil || t.hwnd == 0 {
+		return fmt.Errorf("tray is not ready")
+	}
+	data := notifyIconData{
+		CbSize:      uint32(unsafe.Sizeof(notifyIconData{})),
+		HWnd:        t.hwnd,
+		UID:         1,
+		UFlags:      nifInfo,
+		DwInfoFlags: niifInfo,
+	}
+	copyNotificationText(data.SzInfoTitle[:], title)
+	copyNotificationText(data.SzInfo[:], message)
+	ret, _, err := procShellNotifyIconW.Call(uintptr(nimModify), uintptr(unsafe.Pointer(&data)))
+	if ret == 0 {
+		return fmt.Errorf("show tray notification: %v", err)
+	}
+	return nil
+}
+
+func copyNotificationText(dst []uint16, text string) {
+	if len(dst) == 0 {
+		return
+	}
+	encoded := windows.StringToUTF16(text)
+	if len(encoded) > len(dst) {
+		encoded = encoded[:len(dst)-1]
+	}
+	n := copy(dst, encoded)
+	if n == len(dst) {
+		n--
+	}
+	dst[n] = 0
+}
+
 func (t *Tray) run() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -225,7 +264,7 @@ func createMessageWindow() (uintptr, error) {
 func addIcon(hwnd uintptr) (uintptr, error) {
 	hicon := createTrayIcon()
 	data := notifyIconData{CbSize: uint32(unsafe.Sizeof(notifyIconData{})), HWnd: hwnd, UID: 1, UFlags: nifMessage | nifIcon | nifTip | nifShowTip, UCallbackMessage: wmTrayCallback, HIcon: hicon, UVersion: notifyVersion}
-	copy(data.SzTip[:], windows.StringToUTF16("InstantCapture"))
+	copy(data.SzTip[:], windows.StringToUTF16("InstantCapture - 화면 캡처"))
 	ret, _, err := procShellNotifyIconW.Call(uintptr(nimAdd), uintptr(unsafe.Pointer(&data)))
 	if ret == 0 {
 		if hicon != 0 {
@@ -309,6 +348,20 @@ func showContextMenu(hwnd uintptr) {
 }
 
 func createTrayIcon() uintptr {
+	instance, _, _ := procGetModuleHandleW.Call(0)
+	if instance != 0 {
+		const imageIcon = 1
+		resource, _, _ := procLoadImageW.Call(instance, 1, imageIcon, 32, 32, 0)
+		if resource != 0 {
+			if icon, _, _ := procCopyIcon.Call(resource); icon != 0 {
+				return icon
+			}
+		}
+	}
+	return createFallbackTrayIcon()
+}
+
+func createFallbackTrayIcon() uintptr {
 	andMask := make([]byte, 32*32/8)
 	xorMask := make([]byte, 32*32/8)
 	for i := range andMask {

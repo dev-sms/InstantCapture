@@ -44,6 +44,12 @@ func TestBindingFromNamesRejectsBareLetters(t *testing.T) {
 	}
 }
 
+func TestParseBindingRejectsMalformedFunctionKey(t *testing.T) {
+	if _, ok := ParseBinding("Ctrl+F1garbage"); ok {
+		t.Fatal("malformed function key should be rejected")
+	}
+}
+
 func TestBindingFromNamesSpecialKeys(t *testing.T) {
 	printScreen, ok := BindingFromNames(nil, "PrintScreen")
 	if !ok {

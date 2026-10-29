@@ -10,37 +10,35 @@ Requirements:
 - Visual Studio C++ toolchain with C++/WinRT headers
 - CMake 3.20+
 
-```powershell
-cmake -S tools/window-capture-helper -B build/window-capture-helper -G "Visual Studio 17 2022" -A x64
-cmake --build build/window-capture-helper --config Release
-```
-
-If CMake is unavailable but Visual Studio Build Tools are installed, use the included MSVC script from the repository root:
+Use the repository build script. The compatibility helper script delegates to the same build:
 
 ```powershell
-tools/window-capture-helper/build-msvc.cmd
+.\build.cmd
+# or tools\window-capture-helper\build-msvc.cmd
 ```
 
 ## Run
 
 ```powershell
-build/window-capture-helper/Release/instantcapture-window-helper.exe capture-window --hwnd 0x00123456 --out C:\Temp\ic-window.png --json
+dist\instantcapture-window-helper.exe capture-window --hwnd 0x00123456 --out C:\Temp\ic-window.png --json
 ```
 
 Scrolling capture MVP:
 
 ```powershell
-build/window-capture-helper/Release/instantcapture-window-helper.exe capture-scroll --hwnd 0x00123456 --out C:\Temp\ic-scroll.png --json --max-frames 8 --delay-ms 250 --overlap-px 96
+dist\instantcapture-window-helper.exe capture-scroll --hwnd 0x00123456 --out C:\Temp\ic-scroll.png --json --max-frames 8 --delay-ms 250 --overlap-px 96
 ```
 
-`capture-scroll` uses UI Automation `ScrollPattern` to move the selected window downward and WGC to capture each viewport. Frames are stitched vertically with a fixed overlap crop.
+`capture-scroll` captures the initial WGC frame, sends one controlled wheel step, waits for measured motion and consecutive visually stable frames, then accepts one frame. It repeats until UI Automation reports the bottom, two consecutive wheel attempts produce no body movement, or a safety limit is reached. The original position is restored and verified before stitching.
+
+The stitcher measures visual overlap and detects viewport-fixed UI. Repeated sticky headers, footers, sidebars, and floating panels are excluded from intermediate body observations; edge chrome is preserved once where recoverable.
 
 PowerShell HWND example:
 
 ```powershell
 notepad
 $hwnd = "0x{0:X}" -f (Get-Process notepad | Select-Object -First 1).MainWindowHandle.ToInt64()
-build/window-capture-helper/Release/instantcapture-window-helper.exe capture-window --hwnd $hwnd --out "$env:TEMP\ic-window.png" --method wgc --json
+dist\instantcapture-window-helper.exe capture-window --hwnd $hwnd --out "$env:TEMP\ic-window.png" --method wgc --json
 ```
 
 Success prints JSON to stdout and writes the PNG to `--out`:
@@ -55,7 +53,7 @@ Failures also print JSON when `--json` is present. Diagnostic text is reserved f
 
 - Only `capture-window` and WGC are implemented.
 - `capture-scroll` requires a vertically scrollable UI Automation `ScrollPattern` in the target window.
-- Scroll stitching is an MVP with fixed overlap trimming; sticky headers, virtualized lists, smooth scrolling, and animated content may need later refinement.
+- Virtualized lists, infinite feeds, permanently obscured content, smooth scrolling, and animated content can still make alignment or settlement ambiguous.
 - PrintWindow and visible-crop fallback are intentionally deferred.
 - Minimized, cloaked, protected, DRM, secure desktop, and elevated-permission windows may fail or return unusable frames.
-- The Go UI looks for the helper in the app directory and under `build/window-capture-helper`.
+- The deployed app loads the helper beside `dist\instantcapture.exe`.

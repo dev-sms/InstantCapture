@@ -68,7 +68,10 @@ func Select(ctx context.Context, img image.Image, options ...Options) (image.Rec
 		image:   img,
 		theme:   material.NewTheme(),
 		options: opt,
-		status:  fmt.Sprintf("드래그로 영역 선택, Esc로 취소 | Virtual: %v", opt.VirtualScreen),
+		status:  fmt.Sprintf("드래그로 영역 선택, Esc 또는 우클릭으로 취소 | Virtual: %v", opt.VirtualScreen),
+	}
+	if opt.Hint != "" {
+		selector.status = opt.Hint
 	}
 
 	var ops op.Ops
@@ -169,6 +172,10 @@ func (s *selector) handlePointer(gtx layout.Context) (image.Rectangle, bool) {
 				s.hasCursor = true
 			}
 		case pointer.Press:
+			if isCancelPointerPress(pe) {
+				s.selection.Cancel()
+				return image.Rectangle{}, true
+			}
 			if source, ok := s.viewport.ViewToSource(p); ok {
 				s.cursor = source
 				s.hasCursor = true
@@ -195,6 +202,10 @@ func (s *selector) handlePointer(gtx layout.Context) (image.Rectangle, bool) {
 	return image.Rectangle{}, false
 }
 
+func isCancelPointerPress(ev pointer.Event) bool {
+	return ev.Kind == pointer.Press && ev.Buttons.Contain(pointer.ButtonSecondary)
+}
+
 func (s *selector) drawImage(ops *op.Ops) {
 	if s.viewport.View.Empty() || s.image == nil {
 		return
@@ -212,7 +223,22 @@ func (s *selector) drawDim(ops *op.Ops) {
 	if s.viewport.View.Empty() || s.options.DimAlpha == 0 {
 		return
 	}
-	paint.FillShape(ops, color.NRGBA{A: s.options.DimAlpha}, clip.Rect(s.viewport.View).Op())
+	for _, rect := range dimRects(s.viewport.View, s.selection.ViewRect(), s.selection.Dragging()) {
+		paint.FillShape(ops, color.NRGBA{A: s.options.DimAlpha}, clip.Rect(rect).Op())
+	}
+}
+
+func dimRects(bounds, selection image.Rectangle, selecting bool) []image.Rectangle {
+	selection = selection.Intersect(bounds)
+	if !selecting || selection.Empty() {
+		return []image.Rectangle{bounds}
+	}
+	return []image.Rectangle{
+		image.Rect(bounds.Min.X, bounds.Min.Y, bounds.Max.X, selection.Min.Y),
+		image.Rect(bounds.Min.X, selection.Max.Y, bounds.Max.X, bounds.Max.Y),
+		image.Rect(bounds.Min.X, selection.Min.Y, selection.Min.X, selection.Max.Y),
+		image.Rect(selection.Max.X, selection.Min.Y, bounds.Max.X, selection.Max.Y),
+	}
 }
 
 func (s *selector) drawCrosshair(ops *op.Ops) {
@@ -233,7 +259,7 @@ func (s *selector) drawSelection(ops *op.Ops) {
 	if rect.Empty() {
 		return
 	}
-	drawStrokeRect(ops, rect, color.NRGBA{R: 255, G: 64, B: 64, A: 255}, 3)
+	drawStrokeRect(ops, rect, s.options.SelectionColor, 3)
 }
 
 func (s *selector) drawHint(gtx layout.Context) {
