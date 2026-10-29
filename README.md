@@ -2,6 +2,10 @@
 
 InstantCapture is a Windows screen capture and annotation tool written in Go.
 
+> **Vibe-coded project.** Nearly all of the code and documentation was written by AI coding assistants, directed and tested by a human. It is built and tested on every change, but has not had a line-by-line human review — read the code before relying on it for anything important.
+>
+> 이 프로젝트는 **바이브 코딩**으로 만들었습니다. 코드와 문서 대부분을 사람의 지시와 테스트 아래 AI 코딩 도구가 작성했고, 사람이 한 줄씩 검토하지는 않았습니다.
+
 - Capture a region, window, freeform shape, full monitor, or scrolling content from a global hotkey.
 - Re-capture saved screen regions instantly, or capture straight to the clipboard without opening the editor.
 - Annotate with pen, shapes, arrows, text, highlighter, and mosaic; crop, rotate, and flip.
